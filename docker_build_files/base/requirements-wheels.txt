@@ -1,2 +1,4 @@
 peewee == 3.17.*
 peewee_migrate == 1.12.*
+scipy == 1.11.*
+opencv-python-headless == 4.7.0.*
