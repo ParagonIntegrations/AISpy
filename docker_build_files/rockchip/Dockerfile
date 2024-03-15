@@ -43,6 +43,7 @@ RUN apt-get install -y \
 COPY docker_build_files/base/requirements.txt /requirements.txt
 COPY docker_build_files/base/requirements-wheels.txt /requirements-wheels.txt
 RUN pip3 install -r /requirements.txt
+
 RUN pip3 wheel --wheel-dir=/wheels -r /requirements-wheels.txt
 
 COPY docker_build_files/rockchip/requirements-wheels-rk.txt /requirements-wheels-rk.txt
