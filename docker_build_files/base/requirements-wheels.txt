@@ -1,0 +1,2 @@
+peewee == 3.17.*
+peewee_migrate == 1.12.*
