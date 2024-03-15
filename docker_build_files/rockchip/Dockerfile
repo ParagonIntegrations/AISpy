@@ -49,49 +49,51 @@ COPY docker_build_files/rockchip/requirements-wheels-rk.txt /requirements-wheels
 RUN sed -i "/https:\/\//d" /requirements-wheels.txt
 RUN pip3 wheel --wheel-dir=/rk-wheels -c /requirements-wheels.txt -r /requirements-wheels-rk.txt
 
-RUN ls /opt/virtualenvs/aispy/lib/python3.11/site-packages
-RUN ls /opt/virtualenvs/aispy/lib64/python3.11/site-packages
-#
-#
-#
-## AISpy deps (ffmpeg, python, nginx, go2rtc, s6-overlay, etc)
-#FROM python_base AS rk-basewithdeps
-#ARG TARGETARCH
-#
-#ARG DEBIAN_FRONTEND
-## http://stackoverflow.com/questions/48162574/ddg#49462622
-#ARG APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=DontWarn
-#
-### https://github.com/NVIDIA/nvidia-docker/wiki/Installation-(Native-GPU-Support)
-##ENV NVIDIA_VISIBLE_DEVICES=all
-##ENV NVIDIA_DRIVER_CAPABILITIES="compute,video,utility"
-#
-##ENV PATH="/usr/lib/btbn-ffmpeg/bin:/usr/local/go2rtc/bin:/usr/local/nginx/sbin:${PATH}"
-#
-## Install dependencies
-#
-#
-## Copy Virtualenvironment
-#COPY --from=rk-venv /opt/virtualenvs/aispy /opt/virtualenvs/aispy
-#
-#RUN ldconfig
-#
-#
-#
-#
-## Collect project files in a single layer
-#FROM scratch AS rootfs
-#
-#WORKDIR /opt/aispy/
-#COPY aispy aispy/
-##COPY migrations migrations/
-##COPY --from=web-build /work/dist/ web/
-#
-#
-## Final container
-#FROM rk-basewithdeps AS AISpy
-#
-#WORKDIR /opt/aispy/
-#COPY --from=rootfs / /
-#
-#CMD ["python3"]
+RUN pip3 install -U /wheels/*.whl
+RUN pip3 install -U /rk-wheels/*whl
+
+
+
+
+
+# AISpy deps (ffmpeg, python, nginx, go2rtc, s6-overlay, etc)
+FROM python_base AS rk-basewithdeps
+ARG TARGETARCH
+
+ARG DEBIAN_FRONTEND
+# http://stackoverflow.com/questions/48162574/ddg#49462622
+ARG APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=DontWarn
+
+## https://github.com/NVIDIA/nvidia-docker/wiki/Installation-(Native-GPU-Support)
+#ENV NVIDIA_VISIBLE_DEVICES=all
+#ENV NVIDIA_DRIVER_CAPABILITIES="compute,video,utility"
+
+#ENV PATH="/usr/lib/btbn-ffmpeg/bin:/usr/local/go2rtc/bin:/usr/local/nginx/sbin:${PATH}"
+
+# Install dependencies
+
+
+# Copy Virtualenvironment
+COPY --from=rk-venv /opt/virtualenvs/aispy /opt/virtualenvs/aispy
+
+RUN ldconfig
+
+
+
+
+# Collect project files in a single layer
+FROM scratch AS rootfs
+
+WORKDIR /opt/aispy/
+COPY aispy aispy/
+#COPY migrations migrations/
+#COPY --from=web-build /work/dist/ web/
+
+
+# Final container
+FROM rk-basewithdeps AS AISpy
+
+WORKDIR /opt/aispy/
+COPY --from=rootfs / /
+
+CMD ["python3"]
