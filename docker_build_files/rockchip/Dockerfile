@@ -41,9 +41,10 @@ RUN apt-get install -y \
 
 #install the requirements
 COPY docker_build_files/base/requirements.txt /requirements.txt
-RUN pip3 install -r /requirements.txt
-
 COPY docker_build_files/base/requirements-wheels.txt /requirements-wheels.txt
+RUN pip3 install -r /requirements.txt
+RUN pip3 wheel --wheel-dir=/wheels -r /requirements-wheels.txt
+
 COPY docker_build_files/rockchip/requirements-wheels-rk.txt /requirements-wheels-rk.txt
 RUN sed -i "/https:\/\//d" /requirements-wheels.txt
 RUN pip3 wheel --wheel-dir=/rk-wheels -c /requirements-wheels.txt -r /requirements-wheels-rk.txt
