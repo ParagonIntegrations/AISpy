@@ -96,4 +96,4 @@ FROM rk-basewithdeps AS AISpy
 WORKDIR /opt/aispy/
 COPY --from=rootfs / /
 
-CMD ["python3 aispy"]
+CMD ["python3", "aispy"]
