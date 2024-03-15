@@ -48,6 +48,9 @@ COPY docker_build_files/rockchip/requirements-wheels-rk.txt /requirements-wheels
 RUN sed -i "/https:\/\//d" /requirements-wheels.txt
 RUN pip3 wheel --wheel-dir=/rk-wheels -c /requirements-wheels.txt -r /requirements-wheels-rk.txt
 
+RUN ls /opt/virtualenvs/aispy/lib/python3.11/site-packages
+RUN ls /opt/virtualenvs/aispy/lib64/python3.11/site-packages
+
 
 
 # AISpy deps (ffmpeg, python, nginx, go2rtc, s6-overlay, etc)
