@@ -90,4 +90,4 @@ FROM rk-basewithdeps AS AISpy
 WORKDIR /opt/aispy/
 COPY --from=rootfs / /
 
-ENTRYPOINT ["python3 aispy"]
+ENTRYPOINT ["python3"]
