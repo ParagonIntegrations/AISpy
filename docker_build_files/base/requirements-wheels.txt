@@ -3,3 +3,4 @@ peewee_migrate == 1.12.*
 scipy == 1.11.*
 opencv-python-headless == 4.7.0.*
 python-telegram-bot~=20.7
+supervision~=0.18.0
