@@ -23,19 +23,19 @@ RUN apt-get -qq update \
 #    gpg --dearmor > /usr/share/keyrings/debian-archive-bookworm-stable.gpg \
 #    && echo "deb [signed-by=/usr/share/keyrings/debian-archive-bookworm] http://deb.debian.org/debian bookworm main contrib non-free" | \
 #    tee /etc/apt/sources.list.d/debian-bookworm-nonfree.list
-RUN sed -i 's/^Components: main$/& contrib non-free/' /etc/apt/sources.list.d/debian.sources
-RUN apt-get update
-RUN apt-get install -y \
-    # opencv dependencies
-    build-essential cmake git pkg-config libgtk-3-dev \
-    libavcodec-dev libavformat-dev libswscale-dev libv4l-dev \
-    libxvidcore-dev libx264-dev libjpeg-dev libpng-dev libtiff-dev \
-    gfortran openexr libatlas-base-dev libssl-dev\
-    libtbb2 libtbb-dev libdc1394-22-dev libopenexr-dev \
-    libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev \
-    # scipy dependencies
-    gcc gfortran libopenblas-dev liblapack-dev && \
-    rm -rf /var/lib/apt/lists/*
+#RUN sed -i 's/^Components: main$/& contrib non-free/' /etc/apt/sources.list.d/debian.sources
+#RUN apt-get update
+#RUN apt-get install -y \
+#    # opencv dependencies
+#    build-essential cmake git pkg-config libgtk-3-dev \
+#    libavcodec-dev libavformat-dev libswscale-dev libv4l-dev \
+#    libxvidcore-dev libx264-dev libjpeg-dev libpng-dev libtiff-dev \
+#    gfortran openexr libatlas-base-dev libssl-dev\
+#    libtbb2 libtbb-dev libdc1394-22-dev libopenexr-dev \
+#    libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev \
+#    # scipy dependencies
+#    gcc gfortran libopenblas-dev liblapack-dev && \
+#    rm -rf /var/lib/apt/lists/*
 
 
 #install the requirements
