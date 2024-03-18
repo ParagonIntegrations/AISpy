@@ -1,5 +1,6 @@
 from datetime import datetime
-
+from aispy.detector import create_detector
+from aispy.detector.detectors.rknn import RknnDetectorConfig, RknnDetectorConfig
 
 
 class AISpyApp:
@@ -9,6 +10,8 @@ class AISpyApp:
 
 	def run(self):
 		print(f'Starting app at {datetime.now()}')
+		d_cfg = RknnDetectorConfig(type='rknn')
+		detector = create_detector(d_cfg)
 
 	def start(self):
 		self.run()
