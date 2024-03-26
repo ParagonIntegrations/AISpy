@@ -7,7 +7,7 @@ def create_detector(detector_configuration: DetectorConfig):
     #     logger.warning(
     #         "CPU detectors are not recommended and should only be used for testing or for trial purposes."
     #     )
-    api = api_types.get(detector_configuration.type)
+    api = api_types.get(detector_configuration.type_key)
     if not api:
-        raise ValueError(detector_configuration.type)
+        raise ValueError(detector_configuration.type_key)
     return api(detector_configuration)

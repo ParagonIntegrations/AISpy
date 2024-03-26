@@ -28,11 +28,10 @@ class BaseModelConfig(BaseModel):
 
 class BaseDetectorConfig(BaseModel):
     # the type field must be defined in all subclasses
-    type: str = Field(default="rknn", title="Detector Type")
+    type_key: str = Field(default="rknn", title="Detector Type")
     model: BaseModelConfig = Field(
         default=BaseModelConfig(), title="Detector specific model configuration."
     )
     model_config = ConfigDict(
         extra="allow", arbitrary_types_allowed=True, protected_namespaces=()
     )
-    pass

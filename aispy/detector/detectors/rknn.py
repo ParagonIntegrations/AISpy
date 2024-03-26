@@ -31,7 +31,7 @@ yolov8_suffix = {
 
 
 class RknnDetectorConfig(BaseDetectorConfig):
-    type: Literal[DETECTOR_KEY]
+    type_key: Literal[DETECTOR_KEY]
     core_mask: int = Field(default=7, ge=0, le=7, title="Core mask for NPU.")
 
 
