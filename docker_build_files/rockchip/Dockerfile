@@ -85,10 +85,9 @@ RUN ldconfig
 # Collect project files in a single layer
 FROM scratch AS rootfs
 
-ADD https://github.com/MarcA711/rknpu2/releases/download/v1.5.2/librknnrt_rk356x.so /usr/lib/
-ADD https://github.com/MarcA711/rknpu2/releases/download/v1.5.2/librknnrt_rk3588.so /usr/lib/
+ADD https://github.com/MarcA711/rknn-toolkit2/releases/download/v1.6.0/librknnrt.so /usr/lib/
 
-ADD https://github.com/MarcA711/rknn-models/releases/download/v1.6.0-yolov8-default/default-yolov8n-rk3588.rknn /models/rknn/
+ADD https://github.com/MarcA711/rknn-models/releases/download/v1.6.0-yolov8-default/default-yolov8n-rk3588.rknn /models/rknn/default-yolov8n-rk3588.rknn
 
 WORKDIR /opt/aispy/
 COPY aispy aispy/

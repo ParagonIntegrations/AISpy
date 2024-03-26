@@ -3,6 +3,16 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, ConfigDict
 
+class PixelFormatEnum(str, Enum):
+    rgb = "rgb"
+    bgr = "bgr"
+    yuv = "yuv"
+
+
+class InputTensorEnum(str, Enum):
+    nchw = "nchw"
+    nhwc = "nhwc"
+
 
 class ModelTypeEnum(str, Enum):
     yolov8 = "yolov8"
