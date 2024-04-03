@@ -1,16 +1,20 @@
+import copy
 import logging
 import os
+import sys
 import urllib
 from typing import Literal
 
 import cv2
+import supervision as sv
 import numpy as np
 from pydantic import Field
 from aispy.detector.detector_config import BaseDetectorConfig, BaseModelConfig
 from aispy.detector.detector_api import DetectorAPI
+from aispy.detector.utils.ops import xywh2xyxy, scale_boxes, LetterBox
 
 try:
-    from hide_warnings import hide_warnings # noqa
+    from hide_warnings import hide_warnings  # noqa
 except:
     def hide_warnings(func):
         pass
@@ -67,8 +71,6 @@ class Rknn(DetectorAPI):
             elif "rk3588" in soc:
                 os.rename("/usr/lib/librknnrt_rk3588.so", "/usr/lib/librknnrt.so")
 
-
-
         # Import this on class instantiation to avoid errors on other systems
         from rknnlite.api import RKNNLite
         self.core_mask = config.core_mask
@@ -103,88 +105,85 @@ class Rknn(DetectorAPI):
                 "Error initializing rknn runtime. Do you run docker in privileged mode?"
             )
             pass
+
     def __del__(self):
         self.detector.release()
 
     def preprocess(self, img):
 
         # Resize the image
-        shape = img.shape[:2]  # current shape [height, width]
-        new_shape = (self.model_height, self.model_width)
-        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-        r = min(r, 1.0)
-        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
-        img = cv2.resize(img, new_shape, interpolation=cv2.INTER_LINEAR)
-        img = [np.stack([img])]
+        return [np.stack(self.pre_transform(img))]
 
-        return img
+        # shape = img.shape[:2]  # current shape [height, width]
+        # new_shape = (self.model_height, self.model_width)
+        # r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        # r = min(r, 1.0)
+        # new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        # img = cv2.resize(img, new_shape, interpolation=cv2.INTER_LINEAR)
+        # img = [np.stack([img])]
+        # return img
+
+    def pre_transform(self, img):
+        same_shapes = False
+        new_shape = (self.model_height, self.model_width)
+        letterbox = LetterBox(new_shape, auto=same_shapes)
+        return [letterbox(image=img)]
 
     def inference(self, tensor_input):
-        # print(f'{tensor_input[0].shape=}')
         return self.detector.inference(inputs=tensor_input)
 
+    def postprocess(self, inference_results, orig_image_size, classes, conf, nms, iou):
+        res = self.process_yolov8(inference_results, orig_image_size, conf, classes)
+        if nms:
+            res = res.with_nms(threshold=iou)
+        return res
 
-    def postprocess(self, results):
-        return self.process_yolov8(results)
-
-    def process_yolov8(self, results):
+    def process_yolov8(self, prediction, orig_image_size, conf_thres=0.25, classes=None):
         """
         Processes yolov8 output.
 
         Args:
-        results: array with shape: (1, 84, n, 1) where n depends on yolov8 model size (for 320x320 model n=2100)
+        prediction: array with shape: (batch_size, num_classes + 4, num_boxes) the number of boxes depends on the model size
+        and for a 320x320 model this will be 2100, a typical shape will be (1, 84, 2100) Only the first item of the batch
+        will be used
 
         Returns:
-        detections: array with shape (20, 6) with 20 rows of (class, confidence, y_min, x_min, y_max, x_max)
+        detection: a Supervision Detections object
         """
-        results = np.array(results)
-        results = np.transpose(results[0, 0, :, :])  # array shape (2100, 84)
-        # results = results[0]
-        # results = np.transpose(results[0, :, :, 0])  # array shape (2100, 84)
-        scores = np.max(
-            results[:, 4:], axis=1
-        )  # array shape (2100,); max confidence of each row
 
-        # remove lines with score scores < 0.4
-        filtered_arg = np.argwhere(scores > 0.4)
-        results = results[filtered_arg[:, 0]]
-        scores = scores[filtered_arg[:, 0]]
+        # Checks
+        assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
+        if isinstance(prediction,
+                      (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
+            prediction = prediction[0]  # select only inference output
 
-        num_detections = len(scores)
+        num_classes = prediction.shape[1] - 4
+        class_list = classes if classes else list(range(num_classes))
 
-        if num_detections == 0:
-            return np.zeros((20, 6), np.float32)
+        prediction = np.transpose(prediction[0, :, :])  # Change to shape (2100, 84)
+        conf_array = prediction[:, 4:].max(1)
+        class_array = prediction[:, 4:].argmax(1)
+        conf_filter = conf_array > conf_thres
+        class_filter = np.isin(class_array, class_list)
+        combined_filter = np.logical_and(conf_filter, class_filter)
 
-        if num_detections > 20:
-            top_arg = np.argpartition(scores, -20)[-20:]
-            results = results[top_arg]
-            scores = scores[top_arg]
-            num_detections = 20
+        prediction = prediction[:, :6]
+        prediction[:, 4] = conf_array
+        prediction[:, 5] = class_array
+        prediction = prediction[combined_filter, :]
+        prediction[..., :4] = xywh2xyxy(prediction[..., :4])  # xywh to xyxy
+        prediction[..., :4] = scale_boxes((self.model_height, self.model_width), prediction[..., :4], orig_image_size)
 
-        classes = np.argmax(results[:, 4:], axis=1)
-
-        boxes = np.transpose(
-            np.vstack(
-                (
-                    (results[:, 0] - 0.5 * results[:, 2]) / self.model_width,
-                    (results[:, 1] - 0.5 * results[:, 3]) / self.model_height,
-                    (results[:, 0] + 0.5 * results[:, 2]) / self.model_width,
-                    (results[:, 1] + 0.5 * results[:, 3]) / self.model_height,
-                )
-            )
+        return sv.Detections(
+            xyxy=prediction[:, :4],
+            confidence=prediction[:, 4],
+            class_id=prediction[:, 5].astype(int)
         )
 
-        detections = np.zeros((20, 6), np.float32)
-        detections[:num_detections, 0] = classes
-        detections[:num_detections, 1] = scores
-        detections[:num_detections, 2:] = boxes
-        return detections
+    def detect(self, image, classes=None, conf=0.2, nms=True, iou=0.5, verbose=True) -> sv.Detections:
 
-    def detect(self, image):
-        # print(f'Input {image.shape=}')
         pre_image = self.preprocess(image)
-        inf_res = self.inference(pre_image)
-        # print(f'{inf_res[0].shape=}')
-        post_processes = self.postprocess(inf_res)
-        # print(f'{post_processes.shape=}')
+        orig_image_size = image.shape[:2]
+        inf_result = self.inference(pre_image)
+        post_processes = self.postprocess(inf_result, orig_image_size, classes, conf, nms, iou)
         return post_processes

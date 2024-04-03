@@ -9,5 +9,5 @@ class DetectorAPI(ABC):
         pass
 
     @abstractmethod
-    def detect(self, tensor_input):
+    def detect(self, image, classes=None, conf=0.2, nms=False, verbose=True):
         pass
