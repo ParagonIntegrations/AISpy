@@ -123,7 +123,7 @@ class ObjectDetector(mp.Process):
 				time.sleep(10)
 
 
-	def doinference(self, frame, streamid, double_check=False) -> tuple:
+	def doinference(self, frame, streamid, double_check=True) -> tuple:
 		starttime = datetime.now().timestamp()
 		confidence = self.streaminfos[streamid]['confidence_threshold']
 		classes = self.streaminfos[streamid]['detection_classes']
