@@ -38,6 +38,7 @@ from db_driver import DBDriver
 from telegrambot import Telegrambot
 from watchdog import Watchdog
 import multiprocessing as mp
+from multiprocessing.shared_memory import SharedMemory
 
 
 class FractalApp:
