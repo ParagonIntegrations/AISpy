@@ -5,3 +5,4 @@ opencv-python-headless == 4.7.0.*
 pydantic == 2.6.*
 python-telegram-bot~=20.7
 supervision~=0.18.0
+requests == 2.31.*

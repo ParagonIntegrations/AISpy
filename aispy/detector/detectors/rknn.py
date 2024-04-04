@@ -9,9 +9,9 @@ import cv2
 import supervision as sv
 import numpy as np
 from pydantic import Field
-from aispy.detector.detector_config import BaseDetectorConfig, BaseModelConfig
-from aispy.detector.detector_api import DetectorAPI
-from aispy.detector.utils.ops import xywh2xyxy, scale_boxes, LetterBox
+from detector.detector_config import BaseDetectorConfig, BaseModelConfig
+from detector.detector_api import DetectorAPI
+from detector.utils.ops import xywh2xyxy, scale_boxes, LetterBox
 
 try:
     from hide_warnings import hide_warnings  # noqa
@@ -77,6 +77,7 @@ class Rknn(DetectorAPI):
         self.model_height = config.model.height
         self.model_width = config.model.width
         self.model_path = config.model.path or "default-yolov8n"
+        self.model_names = config.model.names
 
         if self.model_path in yolov8_suffix:
             if self.model_path == "default-yolov8n":
@@ -99,12 +100,10 @@ class Rknn(DetectorAPI):
         self.detector = RKNNLite(verbose=False)
         if self.detector.load_rknn(self.model_path) != 0:
             logger.error("Error initializing rknn model.")
-            pass
         if self.detector.init_runtime(core_mask=self.core_mask) != 0:
             logger.error(
                 "Error initializing rknn runtime. Do you run docker in privileged mode?"
             )
-            pass
 
     def __del__(self):
         self.detector.release()
@@ -130,7 +129,8 @@ class Rknn(DetectorAPI):
         return [letterbox(image=img)]
 
     def inference(self, tensor_input):
-        return self.detector.inference(inputs=tensor_input)
+        inf_res = self.detector.inference(inputs=tensor_input)
+        return inf_res
 
     def postprocess(self, inference_results, orig_image_size, classes, conf, nms, iou):
         res = self.process_yolov8(inference_results, orig_image_size, conf, classes)
@@ -138,7 +138,7 @@ class Rknn(DetectorAPI):
             res = res.with_nms(threshold=iou)
         return res
 
-    def process_yolov8(self, prediction, orig_image_size, conf_thres=0.25, classes=None):
+    def process_yolov8(self, prediction, orig_image_size, conf_thres=0.25, classes=[0]):
         """
         Processes yolov8 output.
 

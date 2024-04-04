@@ -3,3 +3,4 @@ services:
   aispy:
     image: aispy:latest-rk
     privileged: true
+    shm_size: "256mb"

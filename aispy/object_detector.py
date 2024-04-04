@@ -1,17 +1,16 @@
-import pathlib
 import time
 from datetime import datetime
-
-import cv2
 import numpy as np
-from ultralytics import YOLO
 import supervision as sv
 from supervision.draw.utils import draw_polygon
 import multiprocessing as mp
 from settings import UserSettings, Settings
 from utils import mainlogger
+from detector import create_detector
+from detector.detector_api import DetectorAPI
+from detector.detectors.rknn import RknnDetectorConfig
 
-class Detector(mp.Process):
+class ObjectDetector(mp.Process):
 
 	def __init__(self, streaminfo: dict, streamqueues: dict, recordflags: dict, fileinferencequeue: mp.Queue,
 				 snapshotqueue: mp.Queue, fileannotatorsendqueue: mp.Queue, fileannotatorreceivequeue: mp.Queue,
@@ -27,8 +26,7 @@ class Detector(mp.Process):
 		self.avginferencetime = Settings.avg_inference_time
 		self.updatetime = updatetime
 		self.detectorload = detectorload
-		self.model: YOLO = YOLO(Settings.detector_model_path)
-		self.fileinferencemodel = YOLO(Settings.detector_model_path)
+		self.model: DetectorAPI | None = None
 		self.boxannotator = sv.BoxAnnotator(
 			thickness=2,
 			text_thickness=2,
@@ -36,27 +34,9 @@ class Detector(mp.Process):
 			color=sv.Color.BLUE
 		)
 
-	# def start(self) -> None:
-	# 	mainlogger.info(f'Detector starting')
-	# 	snap = mp.Process(target=take_snapshot, args=(self.snapshotqueue,))
-	# 	snap.start()
-	# 	fileanno = mp.Process(target=fileannotator, args=(
-	# 	self.fileannotatorsendqueue, self.fileannotatorreceivequeue, self.fileinferencequeue, self.streaminfos))
-	# 	fileanno.start()
-	# 	detect = mp.Process(target=self.detect)
-	# 	detect.start()
-	# 	# Start acting as watchdog
-	# 	while True:
-	# 		td = datetime.now().timestamp() - self.updatetime.value
-	# 		if td >= 20 and self.updatetime.value:
-	# 			mainlogger.info(f'Detect process seems to be stuck, restarting')
-	# 			detect.kill()
-	# 			detect.join()
-	# 			detect = mp.Process(target=self.detect)
-	# 			detect.start()
-
 
 	def run(self):
+		self.model = create_detector(RknnDetectorConfig(type_key='rknn'))
 		while True:
 			try:
 				mainlogger.info(f'Starting detect process')
@@ -82,11 +62,6 @@ class Detector(mp.Process):
 							annotated_frame, num_detections = self.doinference(frame, streamid)
 						else:
 							annotated_frame, num_detections = frame, 0
-
-						# cv2.imshow('output', annotated_frame)
-						# key = cv2.waitKey(1)
-						# if key == ord('q'):
-						# 	break
 						recordcounter = self.streaminfos[streamid]['recordcounter']
 						if num_detections >= 1:
 							recordcounter += 1
@@ -148,13 +123,12 @@ class Detector(mp.Process):
 				time.sleep(10)
 
 
-	def doinference(self, frame, streamid, double_check=True) -> tuple:
+	def doinference(self, frame, streamid, double_check=False) -> tuple:
 		starttime = datetime.now().timestamp()
 		confidence = self.streaminfos[streamid]['confidence_threshold']
 		classes = self.streaminfos[streamid]['detection_classes']
-		result = self.model.predict(frame, classes=classes, conf=confidence,
-									agnostic_nms=True, iou=0.5, verbose=False)[0]
-		detections = sv.Detections.from_ultralytics(result)
+		detections = self.model.detect(frame, classes=classes, conf=confidence,
+									nms=True, iou=0.5, verbose=False)
 		zone = sv.PolygonZone(self.streaminfos[streamid]['detectarea'],
 							  self.streaminfos[streamid]['dimensions'])
 		zone_detections = detections[zone.trigger(detections=detections)]
@@ -170,9 +144,9 @@ class Detector(mp.Process):
 				newy1 = int(max((y1 - dy*0.3), 0))
 				newy2 = int(min((y2 + dy*0.3), self.streaminfos[streamid]['dimensions'][1]))
 				newframe: np.ndarray = frame[newy1:newy2,newx1:newx2]
-				newresult = self.model.predict(newframe, classes=classes, conf=confidence,
-									agnostic_nms=True, iou=0.5, verbose=False)[0]
-				new_detections = sv.Detections.from_ultralytics(newresult)
+				new_detections = self.model.detect(newframe, classes=classes, conf=confidence,
+									nms=True, iou=0.5, verbose=False)
+				# new_detections = sv.Detections.from_ultralytics(newresult)
 				num_detections = len(new_detections.xyxy)
 				if num_detections:
 					verified.append(True)
@@ -180,7 +154,7 @@ class Detector(mp.Process):
 					verified.append(False)
 			zone_detections = zone_detections[verified]
 		zone_annotated_frame = draw_polygon(frame, zone.polygon, color=sv.Color.GREEN)
-		labels = [f'{self.model.model.names[class_id]} {conf: 0.2f}'
+		labels = [f'{self.model.model_names[class_id]} {conf: 0.2f}'
 				  for class_id, conf in zip(zone_detections.class_id, detections.confidence)]
 		annotated_frame = self.boxannotator.annotate(zone_annotated_frame, detections=zone_detections, labels=labels)
 		num_detections = len(labels)

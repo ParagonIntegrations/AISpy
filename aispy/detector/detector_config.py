@@ -1,6 +1,7 @@
 from enum import Enum
 from typing import Optional
-
+from pathlib import Path
+import yaml
 from pydantic import BaseModel, Field, ConfigDict
 
 class PixelFormatEnum(str, Enum):
@@ -17,6 +18,8 @@ class InputTensorEnum(str, Enum):
 class ModelTypeEnum(str, Enum):
     yolov8 = "yolov8"
 
+
+
 class BaseModelConfig(BaseModel):
     path: Optional[str] = Field(None, title="Custom Object detection model path.")
     width: int = Field(default=320, title="Object detection model input width.")
@@ -24,6 +27,9 @@ class BaseModelConfig(BaseModel):
     detection_model_type: ModelTypeEnum = Field(
         default=ModelTypeEnum.yolov8, title="Object Detection Model Type"
     )
+    classes_path: Path = Path('/opt/aispy/aispy/detector/models/cfg/coco.yaml')
+    names: dict = yaml.safe_load(classes_path.read_text())['names']
+
 
 
 class BaseDetectorConfig(BaseModel):

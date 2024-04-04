@@ -1,7 +1,7 @@
 import multiprocessing as mp
 import threading
 import time
-from detector import Detector
+from object_detector import ObjectDetector
 from mediamanager import FileAnnotator, SnapshotProcessor
 from utils import mainlogger
 
@@ -32,7 +32,7 @@ class Watchdog(threading.Thread):
 			self.streaminfos
 		)
 		self.processes.append(fileanno)
-		detect = Detector(
+		detect = ObjectDetector(
 			self.streaminfos,
 			self.streamqueues,
 			self.recordflags,
@@ -49,7 +49,7 @@ class Watchdog(threading.Thread):
 			process.start()
 
 		while True:
-			# print(f'{self.detectorload.value*100=:.0f}%')
+			print(f'{self.detectorload.value*100=:.0f}%')
 			time.sleep(5)
 
 	def run(self) -> None:
