@@ -5,4 +5,4 @@ services:
     privileged: true
     shm_size: "256mb"
     volumes:
-      -
+      - ./data:/opt/aispy/data

@@ -49,7 +49,7 @@ class Watchdog(threading.Thread):
 			process.start()
 
 		while True:
-			print(f'{self.detectorload.value*100=:.0f}%')
+			mainlogger.debug(f'{self.detectorload.value*100=:.0f}%')
 			time.sleep(5)
 
 	def run(self) -> None:
