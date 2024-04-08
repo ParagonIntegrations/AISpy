@@ -3,6 +3,6 @@ services:
   aispy:
     image: aispy:latest-rk
     privileged: true
-    shm_size: "256mb"
+    shm_size: '8gb'
     volumes:
       - ./data:/opt/aispy/data

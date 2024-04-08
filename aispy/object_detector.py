@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime
 import numpy as np
@@ -12,13 +13,11 @@ from detector.detectors.rknn import RknnDetectorConfig
 
 class ObjectDetector(mp.Process):
 
-	def __init__(self, streaminfo: dict, streamqueues: dict, recordflags: dict, fileinferencequeue: mp.Queue,
+	def __init__(self, streaminfo: dict, fileinferencequeue: mp.Queue,
 				 snapshotqueue: mp.Queue, fileannotatorsendqueue: mp.Queue, fileannotatorreceivequeue: mp.Queue,
 				 updatetime: mp.Value, detectorload: mp.Value):
 		super().__init__()
 		self.streaminfos = streaminfo
-		self.streamqueues = streamqueues
-		self.recordflags = recordflags
 		self.fileinferencequeue = fileinferencequeue
 		self.snapshotqueue = snapshotqueue
 		self.fileannotatorsendqueue = fileannotatorsendqueue
@@ -36,6 +35,7 @@ class ObjectDetector(mp.Process):
 
 
 	def run(self):
+		mainlogger.info(f'Starting detect process with pid {os.getpid()}')
 		self.model = create_detector(RknnDetectorConfig(type_key='rknn'))
 		while True:
 			try:
@@ -48,10 +48,11 @@ class ObjectDetector(mp.Process):
 					for streamid in self.streaminfos.keys():
 						if streamid == 0:
 							continue
-						# Discard the first 2 frames as they are old
-						self.streamqueues[streamid].get()
-						self.streamqueues[streamid].get()
-						framebuff.append(self.streamqueues[streamid].get())
+						# # Discard the first 2 frames as they are old
+						# self.streamqueues[streamid].get()
+						# self.streamqueues[streamid].get()
+						# framebuff.append(self.streamqueues[streamid].get())
+						framebuff.append((streamid, self.streaminfos[streamid]['framebuffer'][-1]))
 					mainlogger.debug(f'Got frames from {len(framebuff)} streams')
 
 					while framebuff:
@@ -72,18 +73,19 @@ class ObjectDetector(mp.Process):
 						self.streaminfos[streamid]['recordcounter'] = recordcounter
 						mainlogger.debug(f'recordcounter {recordcounter}')
 						# Re-check items with a recordcounter of between 1 and UserSettings.detections_for_event to make sure if recording should happen
-						if 0 < recordcounter < UserSettings.detections_for_event and self.recordflags[streamid].value != 1:
-							self.streamqueues[streamid].get()
-							self.streamqueues[streamid].get()
-							framebuff.append(self.streamqueues[streamid].get())
+						if 0 < recordcounter < UserSettings.detections_for_event and self.streaminfos[streamid]['recordflag'].value != 1:
+							# self.streamqueues[streamid].get()
+							# self.streamqueues[streamid].get()
+							# framebuff.append(self.streamqueues[streamid].get())
+							framebuff.append((streamid, self.streaminfos[streamid]['framebuffer'][-1]))
 						# Set the recordflag if needed
-						if recordcounter >= UserSettings.detections_for_event and self.recordflags[streamid].value != 1:
-							self.recordflags[streamid].value = 1
+						if recordcounter >= UserSettings.detections_for_event and self.streaminfos[streamid]['recordflag'].value != 1:
+							self.streaminfos[streamid]['recordflag'].value = 1
 							mainlogger.info(f'Item found on Stream {streamid} setting recordflag')
 							self.snapshotqueue.put((streamid, annotated_frame, f'Alarm Active on stream {streamid}'))
 						# Clear the recordflag when the counter is decreasing and at 1 while recording
-						if recordcounter == 1 and num_detections == 0 and self.recordflags[streamid].value == 1:
-							self.recordflags[streamid].value = 0
+						if recordcounter == 1 and num_detections == 0 and self.streaminfos[streamid]['recordflag'].value == 1:
+							self.streaminfos[streamid]['recordflag'].value = 0
 							mainlogger.info(f'No more items on Stream {streamid}, clearing recordflag')
 							if self.streaminfos[0]['armed'].value and self.streaminfos[streamid]['armed'].value:
 									self.snapshotqueue.put((streamid, annotated_frame, f'Alarm Cleared on stream {streamid}'))

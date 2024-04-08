@@ -28,8 +28,7 @@
 #
 # 	def start(self):
 # 		self.run()
-
-
+import numpy as np
 
 from streams import Stream
 from settings import UserSettings, Settings
@@ -38,7 +37,7 @@ from db_driver import DBDriver
 from telegrambot import Telegrambot
 from watchdog import Watchdog
 import multiprocessing as mp
-from multiprocessing.shared_memory import SharedMemory
+from memory_managers import SharedFrameDeque
 
 
 class FractalApp:
@@ -47,15 +46,26 @@ class FractalApp:
 		mainlogger.info(f'Fractal Initializing')
 		self.db = DBDriver(Settings.db_file)
 		self.streams = {}
-		self.detectqueues = {}
 		self.recordflags = {}
 		self.streaminfos = self.db.load_state()
+		self.fileinferencequeue = None
+		self.dbupdatequeue = None
+		self.init_shared_state_objects()
+
+	def init_shared_state_objects(self):
 		self.fileinferencequeue = mp.Queue()
 		self.dbupdatequeue = mp.Queue()
 		for streamid in UserSettings.streaminfo.keys():
-			self.detectqueues[streamid] = mp.Queue(maxsize=1)
-			self.recordflags[streamid] = mp.Value('i', 0)
 			self.streaminfos[streamid]['armed'] = mp.Value('i', self.streaminfos[streamid]['armed'])
+			if streamid == 0:
+				continue
+			self.recordflags[streamid] = mp.Value('i', 0)
+			self.streaminfos[streamid]['recordflag'] = mp.Value('i', 0)
+			self.streaminfos[streamid]['framebuffer'] = SharedFrameDeque(
+				max_items=int(UserSettings.pre_record_time.total_seconds() * UserSettings.record_fps),
+				itemshape=(self.streaminfos[streamid]['dimensions'][1], self.streaminfos[streamid]['dimensions'][0], 3),
+				datatype=np.uint8
+			)
 
 	def dbupdater(self):
 		while True:
@@ -77,7 +87,7 @@ class FractalApp:
 		for streamid in UserSettings.streaminfo.keys():
 			if streamid == 0:
 				continue
-			stream = Stream(streamid, self.streaminfos[streamid], self.detectqueues[streamid], self.recordflags[streamid], self.fileinferencequeue)
+			stream = Stream(streamid, self.streaminfos[streamid], self.fileinferencequeue)
 			self.streams[streamid] = stream
 		# Start the streams
 		for stream in self.streams.values():
@@ -88,7 +98,7 @@ class FractalApp:
 		t.start()
 
 		# Create and start the detector watchdog
-		watchdog = Watchdog(self.streaminfos, self.detectqueues, self.recordflags, self.fileinferencequeue)
+		watchdog = Watchdog(self.streaminfos, self.fileinferencequeue)
 		watchdog.start()
 
 		# Start the dbupdater

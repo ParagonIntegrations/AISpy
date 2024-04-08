@@ -69,9 +69,9 @@ mainlogger = create_rotating_log(Settings.log_name,
 								 Settings.telegram_token)
 
 
-def send_photo_telegram(image_path, chat_id, token, image_caption=""):
-	data = {"chat_id": chat_id, "caption": image_caption}
-	url = f'https://api.telegram.org/bot{token}/sendPhoto?chat_id={chat_id}'
-	with open(image_path, "rb") as image_file:
-		ret = requests.post(url, data=data, files={"photo": image_file})
-	return ret.json()
+def send_photo_telegram(image_path, chat_ids, token, image_caption=""):
+	for chat_id in chat_ids:
+		data = {"chat_id": chat_id, "caption": image_caption}
+		url = f'https://api.telegram.org/bot{token}/sendPhoto?chat_id={chat_id}'
+		with open(image_path, "rb") as image_file:
+			ret = requests.post(url, data=data, files={"photo": image_file})

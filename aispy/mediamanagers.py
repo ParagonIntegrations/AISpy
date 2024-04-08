@@ -83,7 +83,7 @@ class SnapshotProcessor(mp.Process):
 				snapshot_filename = str(snapshot_dir.joinpath(f'{datetimestr}.png'))
 				cv2.imwrite(snapshot_filename,frame)
 				# Send the photo to telegram
-				send_photo_telegram(snapshot_filename, Settings.telegram_chat_id, Settings.fractal_token, caption)
+				send_photo_telegram(snapshot_filename, Settings.telegram_alarmlist, Settings.fractal_token, caption)
 			except:
 				mainlogger.warning(f'Problem in snapshot processor restarting in 10')
 				self.snapshotqueue.put(item)
