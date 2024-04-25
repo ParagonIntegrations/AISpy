@@ -48,19 +48,16 @@ class ObjectDetector(mp.Process):
 					for streamid in self.streaminfos.keys():
 						if streamid == 0:
 							continue
-						# # Discard the first 2 frames as they are old
-						# self.streamqueues[streamid].get()
-						# self.streamqueues[streamid].get()
-						# framebuff.append(self.streamqueues[streamid].get())
-						framebuff.append((streamid, self.streaminfos[streamid]['framebuffer'][-1]))
+						framebuff.append((streamid, self.streaminfos[streamid]['framebuffer'][-1], None))
 					mainlogger.debug(f'Got frames from {len(framebuff)} streams')
 
 					while framebuff:
 						item = framebuff.pop()
 						streamid = item[0]
 						frame = item[1]
+						motion_detections = item[2]
 						if self.streaminfos[0]['armed'].value and self.streaminfos[streamid]['armed'].value:
-							annotated_frame, num_detections = self.doinference(frame, streamid)
+							annotated_frame, num_detections = self.doinference(frame, streamid, motion_detections=motion_detections)
 						else:
 							annotated_frame, num_detections = frame, 0
 						recordcounter = self.streaminfos[streamid]['recordcounter']
@@ -74,10 +71,11 @@ class ObjectDetector(mp.Process):
 						mainlogger.debug(f'recordcounter {recordcounter}')
 						# Re-check items with a recordcounter of between 1 and UserSettings.detections_for_event to make sure if recording should happen
 						if 0 < recordcounter < UserSettings.detections_for_event and self.streaminfos[streamid]['recordflag'].value != 1:
-							# self.streamqueues[streamid].get()
-							# self.streamqueues[streamid].get()
-							# framebuff.append(self.streamqueues[streamid].get())
-							framebuff.append((streamid, self.streaminfos[streamid]['framebuffer'][-1]))
+							if motion_detections is None:
+								framebuff.append((streamid, self.streaminfos[streamid]['framebuffer'][-1], motion_detections))
+							else:
+								# Append from the motion detector
+								pass
 						# Set the recordflag if needed
 						if recordcounter >= UserSettings.detections_for_event and self.streaminfos[streamid]['recordflag'].value != 1:
 							self.streaminfos[streamid]['recordflag'].value = 1
@@ -125,12 +123,15 @@ class ObjectDetector(mp.Process):
 				time.sleep(10)
 
 
-	def doinference(self, frame, streamid, double_check=True) -> tuple:
+	def doinference(self, frame, streamid, double_check=True, motion_detections=None) -> tuple:
 		starttime = datetime.now().timestamp()
-		confidence = self.streaminfos[streamid]['confidence_threshold']
-		classes = self.streaminfos[streamid]['detection_classes']
-		detections = self.model.detect(frame, classes=classes, conf=confidence,
-									nms=True, iou=0.5, verbose=False)
+		if motion_detections is None:
+			confidence = self.streaminfos[streamid]['confidence_threshold']
+			classes = self.streaminfos[streamid]['detection_classes']
+			detections = self.model.detect(frame, classes=classes, conf=confidence,
+										nms=True, iou=0.5, verbose=False)
+		else:
+			detections = motion_detections
 		zone = sv.PolygonZone(self.streaminfos[streamid]['detectarea'],
 							  self.streaminfos[streamid]['dimensions'])
 		zone_detections = detections[zone.trigger(detections=detections)]

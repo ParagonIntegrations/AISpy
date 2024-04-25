@@ -70,6 +70,18 @@ class SharedFrameDeque:
 			self.memory.buf[self.memhead:self.memhead + self.itemsize] = item
 			return
 
+	def getbyarrayindex(self, arrayindex) -> np.ndarray:
+		# No guarantee that the item still exists
+		with self.lock:
+			if arrayindex > self.max_items:
+				IndexError(f'Cannot access item SharedDeque is only {self.max_items} long')
+			arrayindex = (arrayindex + self.max_items) % self.max_items
+			mbuf = bytearray(self.memory.buf[self.memaddr(arrayindex):self.memaddr(arrayindex + 1)])
+			return np.ndarray(self.itemshape, dtype=self.datatype, buffer=mbuf)
+
+	def getwithindex(self, key) -> tuple[np.ndarray, int]:
+		return self.__getitem__(key, True)
+
 	@property
 	def memhead(self):
 		return self.head.value * self.itemsize
@@ -81,11 +93,11 @@ class SharedFrameDeque:
 	def memaddr(self, index):
 		return index * self.itemsize
 
-	def __getitem__(self, key):
+	def __getitem__(self, key, withindex = False) -> np.ndarray|tuple[np.ndarray, int]|list[np.ndarray]|list[tuple[np.ndarray, int]]:
 		with self.lock:
 			if isinstance(key, slice):
 				start, stop, step = key.indices(self.num_items.value)
-				return [self.__getitem__(x) for x in range(start, stop, step)]
+				return [self.__getitem__(x, withindex) for x in range(start, stop, step)]
 			elif isinstance(key, int):
 				if key > self.num_items.value:
 					IndexError(f'Cannot access item {key}, only {self.num_items.value} in SharedDeque')
@@ -98,6 +110,8 @@ class SharedFrameDeque:
 			else:
 				raise TypeError('Invalid argument type')
 
+			if withindex:
+				return np.ndarray(self.itemshape, dtype=self.datatype, buffer=mbuf), keyindex
 			return np.ndarray(self.itemshape, dtype=self.datatype, buffer=mbuf)
 
 	def __len__(self):
@@ -107,6 +121,14 @@ class SharedFrameDeque:
 	def __del__(self):
 		self.memory.close()
 		self.memory.unlink()
+
+class MotionDetectorSharedMemory:
+	def __init__(self, max_items):
+		self.max_items = max_items
+		self.frameid = mp.Value('I', 0)
+		self.sharedmemory = 1
+
+
 
 if __name__ == '__main__':
 	# shape = (1, 1)
@@ -128,6 +150,7 @@ if __name__ == '__main__':
 	shareddeque_size = int(5*15)
 	deq = SharedFrameDeque(shareddeque_size, shape, type)
 	# deq = collections.deque(maxlen=shareddeque_size)
+
 	# Test append speed
 	start = datetime.datetime.now()
 	for i in range(1000):
@@ -143,6 +166,14 @@ if __name__ == '__main__':
 	end = datetime.datetime.now()
 	speed = (end - start).total_seconds()
 	print(f'Get speed is {speed:0.2f}ms')
+
+	# Test get item by arrayindex speed
+	start = datetime.datetime.now()
+	for i in range(1000):
+		img = deq.getbyarrayindex(-1)
+	end = datetime.datetime.now()
+	speed = (end - start).total_seconds()
+	print(f'Get by array index speed is {speed:0.2f}ms')
 
 	# Test pop speed
 	start = datetime.datetime.now()
