@@ -411,8 +411,12 @@ class Telegrambot(mp.Process):
 
     async def trigger_alarm(self):
         mainlogger.info('Triggering Alarm')
-        requests.get('http://192.168.1.90/cm?cmnd=Power%20On')
-
+        try:
+            requests.get('http://192.168.1.90/cm?cmnd=Power%20On')
+        except:
+            bot = telegram.Bot(Settings.fractal_token)
+            msgs = [await bot.sendMessage(text=f'Error Triggering Alarm', chat_id=id)
+                    for id in Settings.telegram_alarmlist]
 
     def run(self) -> None:
         asyncio.ensure_future(self.notify_alarm())
@@ -470,7 +474,7 @@ class Telegrambot(mp.Process):
 
 if __name__ == "__main__":
     dict = {
-        0:{'armed':mp.Value('i', 1)},
+        0:{'armed':mp.Value('i', 1), 'alarm':mp.Value('i', 1)},
         1:{'armed':mp.Value('i', 1)}
     }
     bot = Telegrambot(dict, mp.Queue())
