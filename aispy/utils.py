@@ -1,6 +1,12 @@
+import asyncio
 import logging
+import time
 from logging import Handler, Formatter
 from logging.handlers import RotatingFileHandler
+
+import telegram
+from telegram import InlineKeyboardButton
+
 from settings import Settings
 import requests
 import datetime
@@ -75,3 +81,4 @@ def send_photo_telegram(image_path, chat_ids, token, image_caption=""):
 		url = f'https://api.telegram.org/bot{token}/sendPhoto?chat_id={chat_id}'
 		with open(image_path, "rb") as image_file:
 			ret = requests.post(url, data=data, files={"photo": image_file})
+

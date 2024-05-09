@@ -1,9 +1,14 @@
+import asyncio
 import copy
 import io
+import math
 import re
+import time
 from functools import wraps
 import multiprocessing as mp
 import cv2
+import requests
+import telegram
 
 from settings import Settings
 from utils import mainlogger
@@ -42,6 +47,16 @@ def restricted_to_user(func):
         return await func(self, update, context, *args, **kwargs)
     return wrapped
 
+def restricted_to_alarmuser(func):
+    @wraps(func)
+    async def wrapped(self, update, context, *args, **kwargs):
+        user_id = update.effective_user.id
+        if user_id not in Settings.telegram_alarmlist:
+            print(f"Unauthorized access denied for {user_id} on {func.__name__}.")
+            return
+        return await func(self, update, context, *args, **kwargs)
+    return wrapped
+
 class Telegrambot(mp.Process):
 
     def __init__(self, streaminfos, dbupdatequeue):
@@ -49,13 +64,17 @@ class Telegrambot(mp.Process):
         super().__init__()
         self.streaminfos: dict = streaminfos
         self.dbupdatequeue = dbupdatequeue
-        self.bot = None
+        self.application: Application | None = None
         self.userkeyboard = ReplyKeyboardMarkup([['/start']], is_persistent=True)
         self.adminkeyboard = ReplyKeyboardMarkup([['/start'],['/admin','exit admin']], is_persistent=True)
 
     def create_arm_disarm_keyboard(self):
-        keyboard = []
-        for streamid in self.streaminfos.keys()        :
+        buttons_per_row = 2
+        num_buttons = len(self.streaminfos.keys())
+        num_rows = math.ceil((num_buttons + buttons_per_row - 1)/buttons_per_row)
+        keyboard = [[] for x in range(num_rows)]
+        for i in range(num_buttons):
+            streamid = list(self.streaminfos.keys())[i]
             if self.streaminfos[streamid]['armed'].value:
                 text = 'Disarm'
             else:
@@ -64,20 +83,32 @@ class Telegrambot(mp.Process):
                 text += ' All'
             else:
                 text += f' Stream {streamid}'
-            streamkeyboard = [InlineKeyboardButton(text, callback_data=f'arm_disarm_{streamid}')]
-            keyboard.append(streamkeyboard)
+            streambutton = [InlineKeyboardButton(text, callback_data=f'arm_disarm_{streamid}')]
+            row = (i+buttons_per_row-1)//buttons_per_row
+            keyboard[row] += streambutton
+        empty_buttons = (num_rows*buttons_per_row - (num_buttons + buttons_per_row - 1))
+        empties = [InlineKeyboardButton('Empty Stream', callback_data='None') for x in range(empty_buttons)]
+        keyboard[-1] += empties
         return keyboard
 
     def create_take_snapshot_keyboard(self):
-        keyboard = []
-        for streamid in self.streaminfos.keys():
+        buttons_per_row = 2
+        num_buttons = len(self.streaminfos.keys())
+        num_rows = math.ceil((num_buttons + buttons_per_row - 1) / buttons_per_row)
+        keyboard = [[] for x in range(num_rows)]
+        for i in range(num_buttons):
+            streamid = list(self.streaminfos.keys())[i]
             text = 'Snapshot for'
             if streamid == 0:
                 text += ' All'
             else:
                 text += f' Stream {streamid}'
             streambutton = [InlineKeyboardButton(text, callback_data=f'take_snapshot_{streamid}')]
-            keyboard.append(streambutton)
+            row = (i+buttons_per_row-1)//buttons_per_row
+            keyboard[row] += streambutton
+        empty_buttons = (num_rows * buttons_per_row - (num_buttons + buttons_per_row - 1))
+        empties = [InlineKeyboardButton('Empty Stream', callback_data='None') for x in range(empty_buttons)]
+        keyboard[-1] += empties
         return keyboard
 
     @restricted_to_admin
@@ -334,10 +365,60 @@ class Telegrambot(mp.Process):
             reply_markup = ReplyKeyboardRemove()
         await update.effective_message.reply_text(reply_str, reply_markup=reply_markup)
 
+    async def notify_alarm(self):
+        bot = telegram.Bot(Settings.fractal_token)
+        keyboard = [
+            [InlineKeyboardButton('Cancel Alarm', callback_data=f'alarm_cancel'),
+            InlineKeyboardButton('Confirm Alarm', callback_data=f'alarm_confirm')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        while True:
+            if self.streaminfos[0]['alarm'].value == 1:
+                timer = 30
+                async with bot:
+                    msgs = [await bot.sendMessage(text=f'Alarm will trigger in {timer}s', reply_markup=reply_markup, chat_id=id) for id in Settings.telegram_alarmlist]
+                    await asyncio.sleep(1)
+                    while (timer > 0) and (self.streaminfos[0]['alarm'].value == 1):
+                        timer -= 1
+                        for msg in msgs:
+                            await msg.edit_text(text=f'Alarm will trigger in {timer}s', reply_markup=reply_markup)
+                        await asyncio.sleep(1)
+                    if self.streaminfos[0]['alarm'].value == 1:
+                        for msg in msgs:
+                            await msg.edit_text(text=f'Alarm Triggered Due to Timer Expiration')
+                        # Trigger the alarm
+                        self.streaminfos[0]['alarm'].value = 0
+                        await self.trigger_alarm()
+            await asyncio.sleep(0.2)
+
+    @restricted_to_alarmuser
+    async def alarm_cancel_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Parses the CallbackQuery and updates the message text."""
+        query = update.callback_query
+        await query.answer()
+        command = re.match(re.compile('^(alarm_)(.*)$'), query.data).group(2)
+        reply_str = 'Error'
+        reply_markup = update.effective_message.reply_markup
+        if command == 'cancel':
+            self.streaminfos[0]['alarm'].value = 0
+            reply_str = 'Alarm Cancelled'
+        elif command == 'confirm':
+            # Trigger the alarm
+            self.streaminfos[0]['alarm'].value = 0
+            await self.trigger_alarm()
+            reply_str = 'Alarm Confirmed'
+        await query.edit_message_text(text=reply_str, reply_markup=reply_markup)
+
+    async def trigger_alarm(self):
+        mainlogger.info('Triggering Alarm')
+        requests.get('http://192.168.1.90/cm?cmnd=Power%20On')
+
+
     def run(self) -> None:
+        asyncio.ensure_future(self.notify_alarm())
         """Run the bot."""
         # Create the Application and pass it your bot's token.
-        self.bot = Application.builder().token(Settings.fractal_token).build()
+        self.application = Application.builder().token(Settings.fractal_token).build()
 
         adminconversation = ConversationHandler(
             entry_points=[
@@ -375,15 +456,16 @@ class Telegrambot(mp.Process):
             ],
         )
 
-        self.bot.add_handler(adminconversation)
-        self.bot.add_handler(CommandHandler("start", self.start_command))
-        self.bot.add_handler(CallbackQueryHandler(self.arm_disarm, pattern='^arm_disarm_.*$'))
-        self.bot.add_handler(CallbackQueryHandler(self.take_snapshot, pattern='^take_snapshot_.*$'))
-        self.bot.add_handler(CommandHandler("help", self.help_command))
-        self.bot.add_handler(MessageHandler(filters.ALL, self.help_command))
+        self.application.add_handler(adminconversation)
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CallbackQueryHandler(self.arm_disarm, pattern='^arm_disarm_.*$'))
+        self.application.add_handler(CallbackQueryHandler(self.take_snapshot, pattern='^take_snapshot_.*$'))
+        self.application.add_handler(CallbackQueryHandler(self.alarm_cancel_confirm, pattern='^alarm_.*$'))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(MessageHandler(filters.ALL, self.help_command))
 
-        # Run the bot until the user presses Ctrl-C
-        self.bot.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Run the bot forever
+        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

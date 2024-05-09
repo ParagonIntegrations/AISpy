@@ -80,13 +80,14 @@ class ObjectDetector(mp.Process):
 						if recordcounter >= UserSettings.detections_for_event and self.streaminfos[streamid]['recordflag'].value != 1:
 							self.streaminfos[streamid]['recordflag'].value = 1
 							mainlogger.info(f'Item found on Stream {streamid} setting recordflag')
+							self.streaminfos[0]['alarm'].value = 1
 							self.snapshotqueue.put((streamid, annotated_frame, f'Alarm Active on stream {streamid}'))
 						# Clear the recordflag when the counter is decreasing and at 1 while recording
 						if recordcounter == 1 and num_detections == 0 and self.streaminfos[streamid]['recordflag'].value == 1:
 							self.streaminfos[streamid]['recordflag'].value = 0
 							mainlogger.info(f'No more items on Stream {streamid}, clearing recordflag')
 							if self.streaminfos[0]['armed'].value and self.streaminfos[streamid]['armed'].value:
-									self.snapshotqueue.put((streamid, annotated_frame, f'Alarm Cleared on stream {streamid}'))
+								self.snapshotqueue.put((streamid, annotated_frame, f'Alarm Cleared on stream {streamid}'))
 
 					# After all frames have been processed do other detection work if there is time left
 					now = datetime.now()
