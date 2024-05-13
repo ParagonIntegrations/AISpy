@@ -10,7 +10,7 @@ import cv2
 import requests
 import telegram
 
-from settings import Settings
+from settings import Settings, UserSettings
 from utils import mainlogger
 import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -412,7 +412,7 @@ class Telegrambot(mp.Process):
     async def trigger_alarm(self):
         mainlogger.info('Triggering Alarm')
         try:
-            requests.get('http://192.168.1.90/cm?cmnd=Power%20On')
+            requests.get(f'http://{UserSettings.alarm_relay_ip}/cm?cmnd=Power%20On')
         except:
             bot = telegram.Bot(Settings.fractal_token)
             msgs = [await bot.sendMessage(text=f'Error Triggering Alarm', chat_id=id)
