@@ -1,6 +1,7 @@
 peewee == 3.17.*
 peewee_migrate == 1.12.*
 scipy == 1.11.*
+numpy == 1.26.*
 opencv-python-headless == 4.7.0.*
 pydantic == 2.6.*
 python-telegram-bot~=20.7
