@@ -1,4 +1,4 @@
-version: "3"
+
 services:
   aispy:
     image: aispy:latest-rk
@@ -7,3 +7,5 @@ services:
     restart: unless-stopped
     volumes:
       - ./data:/opt/aispy/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro

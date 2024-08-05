@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import datetime
 import io
 import math
 import re
@@ -11,7 +12,7 @@ import requests
 import telegram
 
 from settings import Settings, UserSettings
-from utils import mainlogger
+from utils import mainlogger, AutoArm
 import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, MessageHandler, ConversationHandler,
@@ -67,6 +68,7 @@ class Telegrambot(mp.Process):
         self.application: Application | None = None
         self.userkeyboard = ReplyKeyboardMarkup([['/start']], is_persistent=True)
         self.adminkeyboard = ReplyKeyboardMarkup([['/start'],['/admin','exit admin']], is_persistent=True)
+        self.usetimer = True
 
     def create_arm_disarm_keyboard(self):
         buttons_per_row = 2
@@ -418,8 +420,91 @@ class Telegrambot(mp.Process):
             msgs = [await bot.sendMessage(text=f'Error Triggering Alarm', chat_id=id)
                     for id in Settings.telegram_alarmlist]
 
+    async def auto_arm_disarm_timer(self):
+        next_action = 'undefined'
+        timerlist = [
+            AutoArm(19, active_days=[0,2,3,4,5,6]),
+            AutoArm(20, 30, active_days=[1]),
+            AutoArm(7, do_arm=False)
+        ]
+        print(timerlist[0])
+        # arm_hour = 21
+        # disarm_hour = 7
+        check_if_active_time = 1
+        while True:
+            if self.usetimer:
+                for timer in timerlist:
+                    action = timer.check_action()
+                    if action is True:
+                        print(f'{timer} triggered')
+                        self.streaminfos[0]['armed'].value = 1
+                    elif action is False:
+                        print(f'{timer} triggered')
+                        self.streaminfos[0]['armed'].value = 0
+                await asyncio.sleep(check_if_active_time)
+                # curr_date = datetime.date.today()
+                # if next_action == 'arm':
+                #     if arm_hour > disarm_hour:
+                #         action_date = curr_date  + datetime.timedelta(days=1)
+                #     else:
+                #         action_date = curr_date
+                #     self.streaminfos[0]['armed'].value = 1
+                #     next_action = 'disarm'
+                #     disarm_time = datetime.datetime.strptime(f'{action_date} {disarm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
+                #     sleep_time = (disarm_time - datetime.datetime.now()).total_seconds()
+                # elif next_action == 'disarm':
+                #     self.streaminfos[0]['armed'].value = 0
+                #     next_action = 'arm'
+                #     if arm_hour > disarm_hour:
+                #         action_date = curr_date
+                #     else:
+                #         action_date = curr_date + datetime.timedelta(days=1)
+                #     arm_time = datetime.datetime.strptime(f'{action_date} {arm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
+                #     sleep_time = (arm_time - datetime.datetime.now()).total_seconds()
+                # else:
+                #     curr_datetime = datetime.datetime.now()
+                #     if arm_hour > disarm_hour:
+                #         if curr_datetime.hour < disarm_hour:
+                #             next_action = 'disarm'
+                #             action_date = curr_date
+                #             disarm_time = datetime.datetime.strptime(f'{action_date} {disarm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
+                #             sleep_time = (disarm_time - datetime.datetime.now()).total_seconds()
+                #         elif curr_datetime.hour < arm_hour:
+                #             next_action = 'arm'
+                #             action_date = curr_date
+                #             arm_time = datetime.datetime.strptime(f'{action_date} {arm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
+                #             sleep_time = (arm_time - datetime.datetime.now()).total_seconds()
+                #         else:
+                #             next_action = 'disarm'
+                #             action_date = curr_date + datetime.timedelta(days=1)
+                #             disarm_time = datetime.datetime.strptime(f'{action_date} {disarm_hour}:00:00',
+                #                                                      '%Y-%m-%d %H:%M:%S')
+                #             sleep_time = (disarm_time - datetime.datetime.now()).total_seconds()
+                #     else:
+                #         if curr_datetime.hour < arm_hour:
+                #             next_action = 'arm'
+                #             action_date = curr_date
+                #             arm_time = datetime.datetime.strptime(f'{action_date} {arm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
+                #             sleep_time = (arm_time - datetime.datetime.now()).total_seconds()
+                #         elif curr_datetime.hour < disarm_hour:
+                #             next_action = 'disarm'
+                #             action_date = curr_date
+                #             disarm_time = datetime.datetime.strptime(f'{action_date} {disarm_hour}:00:00',
+                #                                                      '%Y-%m-%d %H:%M:%S')
+                #             sleep_time = (disarm_time - datetime.datetime.now()).total_seconds()
+                #         else:
+                #             next_action = 'arm'
+                #             action_date = curr_date + datetime.timedelta(days=1)
+                #             arm_time = datetime.datetime.strptime(f'{action_date} {arm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
+                #             sleep_time = (arm_time - datetime.datetime.now()).total_seconds()
+                # await asyncio.sleep(sleep_time)
+            else:
+                await asyncio.sleep(check_if_active_time)
+
+
     def run(self) -> None:
         asyncio.ensure_future(self.notify_alarm())
+        asyncio.ensure_future(self.auto_arm_disarm_timer())
         """Run the bot."""
         # Create the Application and pass it your bot's token.
         self.application = Application.builder().token(Settings.fractal_token).build()

@@ -68,7 +68,8 @@ class ObjectDetector(mp.Process):
 						recordcounter = max(0, recordcounter)
 						recordcounter = min(recordcounter, UserSettings.detections_for_event*2)
 						self.streaminfos[streamid]['recordcounter'] = recordcounter
-						mainlogger.debug(f'recordcounter {recordcounter}')
+						if recordcounter:
+							mainlogger.debug(f'recordcounter {recordcounter}')
 						# Re-check items with a recordcounter of between 1 and UserSettings.detections_for_event to make sure if recording should happen
 						if 0 < recordcounter < UserSettings.detections_for_event and self.streaminfos[streamid]['recordflag'].value != 1:
 							if motion_detections is None:
