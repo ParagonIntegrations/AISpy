@@ -421,15 +421,14 @@ class Telegrambot(mp.Process):
                     for id in Settings.telegram_alarmlist]
 
     async def auto_arm_disarm_timer(self):
-        next_action = 'undefined'
+        bot = telegram.Bot(Settings.fractal_token)
         timerlist = [
-            AutoArm(19, active_days=[0,2,3,4,5,6]),
+            # Arm
+            AutoArm(19, active_days=[0, 2, 3, 4, 5, 6]),
             AutoArm(20, 30, active_days=[1]),
+            # Disarm
             AutoArm(7, do_arm=False)
         ]
-        print(timerlist[0])
-        # arm_hour = 21
-        # disarm_hour = 7
         check_if_active_time = 1
         while True:
             if self.usetimer:
@@ -438,66 +437,14 @@ class Telegrambot(mp.Process):
                     if action is True:
                         print(f'{timer} triggered')
                         self.streaminfos[0]['armed'].value = 1
+                        msgs = [await bot.sendMessage(text=f'Auto Armed', chat_id=id)
+                                for id in Settings.telegram_notify_arm_disarm_list]
                     elif action is False:
                         print(f'{timer} triggered')
                         self.streaminfos[0]['armed'].value = 0
+                        msgs = [await bot.sendMessage(text=f'Auto Disarmed', chat_id=id)
+                                for id in Settings.telegram_notify_arm_disarm_list]
                 await asyncio.sleep(check_if_active_time)
-                # curr_date = datetime.date.today()
-                # if next_action == 'arm':
-                #     if arm_hour > disarm_hour:
-                #         action_date = curr_date  + datetime.timedelta(days=1)
-                #     else:
-                #         action_date = curr_date
-                #     self.streaminfos[0]['armed'].value = 1
-                #     next_action = 'disarm'
-                #     disarm_time = datetime.datetime.strptime(f'{action_date} {disarm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
-                #     sleep_time = (disarm_time - datetime.datetime.now()).total_seconds()
-                # elif next_action == 'disarm':
-                #     self.streaminfos[0]['armed'].value = 0
-                #     next_action = 'arm'
-                #     if arm_hour > disarm_hour:
-                #         action_date = curr_date
-                #     else:
-                #         action_date = curr_date + datetime.timedelta(days=1)
-                #     arm_time = datetime.datetime.strptime(f'{action_date} {arm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
-                #     sleep_time = (arm_time - datetime.datetime.now()).total_seconds()
-                # else:
-                #     curr_datetime = datetime.datetime.now()
-                #     if arm_hour > disarm_hour:
-                #         if curr_datetime.hour < disarm_hour:
-                #             next_action = 'disarm'
-                #             action_date = curr_date
-                #             disarm_time = datetime.datetime.strptime(f'{action_date} {disarm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
-                #             sleep_time = (disarm_time - datetime.datetime.now()).total_seconds()
-                #         elif curr_datetime.hour < arm_hour:
-                #             next_action = 'arm'
-                #             action_date = curr_date
-                #             arm_time = datetime.datetime.strptime(f'{action_date} {arm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
-                #             sleep_time = (arm_time - datetime.datetime.now()).total_seconds()
-                #         else:
-                #             next_action = 'disarm'
-                #             action_date = curr_date + datetime.timedelta(days=1)
-                #             disarm_time = datetime.datetime.strptime(f'{action_date} {disarm_hour}:00:00',
-                #                                                      '%Y-%m-%d %H:%M:%S')
-                #             sleep_time = (disarm_time - datetime.datetime.now()).total_seconds()
-                #     else:
-                #         if curr_datetime.hour < arm_hour:
-                #             next_action = 'arm'
-                #             action_date = curr_date
-                #             arm_time = datetime.datetime.strptime(f'{action_date} {arm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
-                #             sleep_time = (arm_time - datetime.datetime.now()).total_seconds()
-                #         elif curr_datetime.hour < disarm_hour:
-                #             next_action = 'disarm'
-                #             action_date = curr_date
-                #             disarm_time = datetime.datetime.strptime(f'{action_date} {disarm_hour}:00:00',
-                #                                                      '%Y-%m-%d %H:%M:%S')
-                #             sleep_time = (disarm_time - datetime.datetime.now()).total_seconds()
-                #         else:
-                #             next_action = 'arm'
-                #             action_date = curr_date + datetime.timedelta(days=1)
-                #             arm_time = datetime.datetime.strptime(f'{action_date} {arm_hour}:00:00', '%Y-%m-%d %H:%M:%S')
-                #             sleep_time = (arm_time - datetime.datetime.now()).total_seconds()
-                # await asyncio.sleep(sleep_time)
             else:
                 await asyncio.sleep(check_if_active_time)
 
