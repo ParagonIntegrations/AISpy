@@ -9,7 +9,7 @@ build-rk: version
 push-rk: build-rk
 	docker buildx bake --push --file=docker_build_files/rockchip/rk.hcl --set rk.tags=$(IMAGE_REPO):${GITHUB_REF_NAME}-$(COMMIT_HASH)-rk rk
 
-release-rk: version
+release-rk: push-rk
 	docker pull $(IMAGE_REPO):${GITHUB_REF_NAME}-$(COMMIT_HASH)-rk
 	docker tag $(IMAGE_REPO):${GITHUB_REF_NAME}-$(COMMIT_HASH)-rk $(IMAGE_REPO):latest-rk
 	docker push $(IMAGE_REPO):latest-rk
