@@ -3,6 +3,7 @@ import copy
 import datetime
 import io
 import math
+import os
 import re
 import time
 from functools import wraps
@@ -129,6 +130,7 @@ class Telegrambot(mp.Process):
         await update.message.reply_text(f'Exited admin interface',)
         return ConversationHandler.END
 
+    # User Management Section
     @restricted_to_admin
     async def user_management_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -271,6 +273,7 @@ class Telegrambot(mp.Process):
         reply_str = 'Choose an alarm user to remove'
         await query.edit_message_text(text=reply_str, reply_markup=reply_markup)
 
+    # Stream Management Section
     @restricted_to_admin
     async def stream_management_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -284,6 +287,76 @@ class Telegrambot(mp.Process):
         reply_str = 'Choose an option'
         await query.edit_message_text(text=reply_str, reply_markup=reply_markup)
 
+    # System Management Section
+
+    def create_timer_keyboard(self):
+        if self.usetimer:
+            button = [InlineKeyboardButton('Disable Timers', callback_data=f'disable_timer_0'),]
+        else:
+            button = [InlineKeyboardButton('Enable Timers', callback_data=f'enable_timer_0'),]
+        return button
+
+    @restricted_to_admin
+    async def system_management_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+
+        keyboard = [
+                [InlineKeyboardButton('Restart', callback_data=f'restart_docker'),],
+                [InlineKeyboardButton('Timers', callback_data=f'timer_management_show'),]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_str = 'Choose an option'
+        await query.edit_message_text(text=reply_str, reply_markup=reply_markup)
+
+    @restricted_to_admin
+    async def restart_docker(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        reply_str = 'Restarting'
+        await query.edit_message_text(text=reply_str)
+        os.kill(1, 9)
+
+    @restricted_to_admin
+    async def timer_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        keyboard = [self.create_timer_keyboard()]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_str = 'Choose an option'
+        await query.edit_message_text(text=reply_str, reply_markup=reply_markup)
+
+    @restricted_to_admin
+    async def enable_timer(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        timer_number = re.match(re.compile('^(timer_management_enable_)(.*)$'), query.data).group(2)
+        if timer_number == 0:
+            self.usetimer = True
+            reply_str = f'Enabled All Timers'
+        else:
+            reply_str = f'Enabled Timer {timer_number}'
+        keyboard = [self.create_timer_keyboard()]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text=reply_str, reply_markup=reply_markup)
+
+    @restricted_to_admin
+    async def disable_timer(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        timer_number = re.match(re.compile('^(timer_management_disable_)(.*)$'), query.data).group(2)
+        if timer_number == 0:
+            self.usetimer = False
+            reply_str = f'Disabled All Timers'
+        else:
+            reply_str = f'Disabled Timer {timer_number}'
+        keyboard = [self.create_timer_keyboard()]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text=reply_str, reply_markup=reply_markup)
+
+
+
+    # General Section
     @restricted_to_user
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         keyboard = [
@@ -321,9 +394,10 @@ class Telegrambot(mp.Process):
                 self.streaminfos[streamid]['armed'].value = 1
                 self.dbupdatequeue.put('Update')
             if streamid == 0:
-                reply_str += ' All'
+                reply_str += f' All'
             else:
                 reply_str += f' Stream {streamid}'
+            reply_str += f' at {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
             mainlogger.info(reply_str)
         reply_markup = InlineKeyboardMarkup(self.create_arm_disarm_keyboard())
         await query.edit_message_text(text=reply_str, reply_markup=reply_markup)
@@ -395,7 +469,6 @@ class Telegrambot(mp.Process):
 
     @restricted_to_alarmuser
     async def alarm_cancel_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Parses the CallbackQuery and updates the message text."""
         query = update.callback_query
         await query.answer()
         command = re.match(re.compile('^(alarm_)(.*)$'), query.data).group(2)
@@ -470,6 +543,11 @@ class Telegrambot(mp.Process):
                     CallbackQueryHandler(self.user_management_add_alarm_user, pattern='^user_management_add_alarm_user_show$'),
                     CallbackQueryHandler(self.user_management_remove_alarm_user, pattern='^user_management_remove_alarm_user_.*$'),
                     CallbackQueryHandler(self.stream_management_entry, pattern='^stream_management_show$'),
+                    CallbackQueryHandler(self.system_management_entry, pattern='^system_management_show$'),
+                    CallbackQueryHandler(self.restart_docker, pattern='^restart_docker$'),
+                    CallbackQueryHandler(self.timer_entry, pattern='^timer_management_show$'),
+                    CallbackQueryHandler(self.enable_timer, pattern='^timer_management_enable_.*$'),
+                    CallbackQueryHandler(self.disable_timer, pattern='^timer_management_disable_.*$'),
                 ],
                 'add_admin_text_input': [
                     MessageHandler(filters.TEXT & ~(filters.COMMAND | filters.Regex("^exit admin$")),
