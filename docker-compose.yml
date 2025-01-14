@@ -1,7 +1,8 @@
 
 services:
   aispy:
-    image: nelisvolschenk/aispy:main-d5d13fd-rk
+#    image: nelisvolschenk/aispy:main-d5d13fd-rk
+    image: nelisvolschenk/aispy:main-2ace470-rk
     privileged: true
     shm_size: '8gb'
     restart: unless-stopped
@@ -9,4 +10,4 @@ services:
       - ./data:/opt/aispy/data
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
-#      - ./aispy:/opt/aispy/aispy
+      - ./aispy:/opt/aispy/aispy

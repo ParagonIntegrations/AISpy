@@ -119,7 +119,7 @@ class Telegrambot(mp.Process):
         keyboard = [
             [InlineKeyboardButton('User Management', callback_data=f'user_management_show')],
             [InlineKeyboardButton('Stream Management', callback_data=f'stream_management_show')],
-            [InlineKeyboardButton('System Settings', callback_data=f'system_settings_show')],
+            [InlineKeyboardButton('System Settings', callback_data=f'system_management_show')],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.effective_message.reply_text("Choose an action:", reply_markup=reply_markup)
@@ -288,14 +288,6 @@ class Telegrambot(mp.Process):
         await query.edit_message_text(text=reply_str, reply_markup=reply_markup)
 
     # System Management Section
-
-    def create_timer_keyboard(self):
-        if self.usetimer:
-            button = [InlineKeyboardButton('Disable Timers', callback_data=f'disable_timer_0'),]
-        else:
-            button = [InlineKeyboardButton('Enable Timers', callback_data=f'enable_timer_0'),]
-        return button
-
     @restricted_to_admin
     async def system_management_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -317,6 +309,13 @@ class Telegrambot(mp.Process):
         await query.edit_message_text(text=reply_str)
         os.kill(1, 9)
 
+    def create_timer_keyboard(self):
+        if self.usetimer:
+            button = [InlineKeyboardButton('Disable Timers', callback_data=f'timer_management_disable_0'), ]
+        else:
+            button = [InlineKeyboardButton('Enable Timers', callback_data=f'timer_management_enable_0'), ]
+        return button
+
     @restricted_to_admin
     async def timer_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -330,7 +329,7 @@ class Telegrambot(mp.Process):
     async def enable_timer(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         await query.answer()
-        timer_number = re.match(re.compile('^(timer_management_enable_)(.*)$'), query.data).group(2)
+        timer_number = int(re.match(re.compile('^(timer_management_enable_)(.*)$'), query.data).group(2))
         if timer_number == 0:
             self.usetimer = True
             reply_str = f'Enabled All Timers'
@@ -344,7 +343,7 @@ class Telegrambot(mp.Process):
     async def disable_timer(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         await query.answer()
-        timer_number = re.match(re.compile('^(timer_management_disable_)(.*)$'), query.data).group(2)
+        timer_number = int(re.match(re.compile('^(timer_management_disable_)(.*)$'), query.data).group(2))
         if timer_number == 0:
             self.usetimer = False
             reply_str = f'Disabled All Timers'
