@@ -13,8 +13,9 @@ import requests
 import telegram
 
 from settings import Settings, UserSettings
-from utils import mainlogger, AutoArm
+from utils import mainlogger
 import logging
+from autoarm import AutoArm
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, MessageHandler, ConversationHandler,
                           ContextTypes, filters)
