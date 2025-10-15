@@ -2,7 +2,7 @@
 services:
   aispy:
 #    image: nelisvolschenk/aispy:main-d5d13fd-rk
-    image: nelisvolschenk/aispy:main-2ace470-rk
+    image: nelisvolschenk/aispy:latest-rk
     privileged: true
     shm_size: '8gb'
     restart: unless-stopped

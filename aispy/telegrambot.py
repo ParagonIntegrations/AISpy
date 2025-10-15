@@ -494,13 +494,7 @@ class Telegrambot(mp.Process):
 
     async def auto_arm_disarm_timer(self):
         bot = telegram.Bot(Settings.fractal_token)
-        timerlist = [
-            # Arm
-            AutoArm(19, active_days=[0, 2, 3, 4, 5, 6]),
-            AutoArm(20, 30, active_days=[1]),
-            # Disarm
-            AutoArm(7, do_arm=False)
-        ]
+        timerlist = UserSettings.auto_arm_disarm_list
         check_if_active_time = 1
         while True:
             if self.usetimer:

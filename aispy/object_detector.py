@@ -49,6 +49,15 @@ class ObjectDetector(mp.Process):
 						if streamid == 0:
 							continue
 						framebuff.append((streamid, self.streaminfos[streamid]['framebuffer'][-1], None))
+					# # Workaround for stream 4
+					# id = 4
+					# fr = self.streaminfos[id]['framebuffer'][-1]
+					# # mainlogger.info(f'Shape')
+					# # mainlogger.info(f'{fr.shape}')
+					# cutframe = fr[272:816,384:1344,:]
+					# # mainlogger.info(f'{cutframe.shape}')
+					# # self.snapshotqueue.put((4,cutframe,f'Test'))
+					# framebuff.append((id, cutframe, None))
 					mainlogger.debug(f'Got frames from {len(framebuff)} streams')
 
 					while framebuff:
