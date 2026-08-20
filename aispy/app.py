@@ -36,6 +36,9 @@ class FractalApp:
 		self.process_outputs['detector']['load'] = mp.Value('d', 0.0)
 
 		self.streaminfos[0]['alarm'] = mp.Value('i', 0)
+		# Owned here, not by the bot: the auto arm/disarm schedule is replayed once per
+		# app start, so a Telegrambot process restart cannot undo a manual arm/disarm.
+		self.streaminfos[0]['timer_state_applied'] = mp.Value('i', 0)
 		for streamid in UserSettings.streaminfo.keys():
 			self.streaminfos[streamid]['armed'] = mp.Value('i', self.streaminfos[streamid]['armed'])
 			if streamid == 0:

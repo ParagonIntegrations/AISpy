@@ -15,7 +15,7 @@ import requests
 from settings import Settings, UserSettings
 from utils import mainlogger
 import logging
-from autoarm import AutoArm
+from autoarm import AutoArm, last_scheduled_action
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, MessageHandler, ConversationHandler,
                           ContextTypes, filters)
@@ -73,6 +73,8 @@ class Telegrambot(mp.Process):
         self.userkeyboard = ReplyKeyboardMarkup([['/start']], is_persistent=True)
         self.adminkeyboard = ReplyKeyboardMarkup([['/start'],['/admin','exit admin']], is_persistent=True)
         self.usetimer = True
+        # Startup arm/disarm message, waiting for Telegram to come up (see post_init).
+        self.startup_notification: asyncio.Task | None = None
 
     def create_arm_disarm_keyboard(self):
         buttons_per_row = 2
@@ -540,20 +542,82 @@ class Telegrambot(mp.Process):
             mainlogger.exception('Error Triggering Alarm')
             await self.send_best_effort(Settings.telegram_alarmlist, f'Error Triggering Alarm')
 
+    def set_armed(self, armed: int) -> None:
+        """Set the master armed flag and persist it, the same way the buttons do.
+
+        The timer path used to skip the db write, so a scheduled arm/disarm was lost on
+        restart and the state loaded from the db was already stale before this ran.
+        """
+        self.streaminfos[0]['armed'].value = armed
+        self.dbupdatequeue.put('Update')
+
+    async def notify_when_connected(self, chat_ids, text, wait=300) -> None:
+        """Send as soon as Telegram is reachable, without holding up the local logic.
+
+        A startup notification loses the race against the Application: the local loop runs
+        long before polling has connected, so sending straight away would just log
+        'Telegram is not connected' and drop the message. Arming itself never waits.
+        """
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if self.application is not None and self.app_loop is not None and self.application.running:
+                break
+            await asyncio.sleep(1)
+        await self.send_best_effort(chat_ids, text)
+
+    async def apply_startup_arm_state(self, timerlist) -> None:
+        """Put the system into the state the schedule says it should be in.
+
+        The armed state restored from the database is whatever it happened to be when the
+        process last died, which after an overnight outage is simply wrong. Rather than
+        replaying a week of firings, we ask which timer fired most recently: every earlier
+        firing is overwritten by that one anyway.
+
+        Only done once per app start. The flag lives in shared state owned by the parent
+        process, so a Telegrambot restart does not silently undo a manual arm/disarm.
+        """
+        applied = self.streaminfos[0].get('timer_state_applied')
+        if applied is not None:
+            if applied.value:
+                return
+            applied.value = 1
+        for timer in timerlist:
+            if timer.never_fires():
+                mainlogger.warning(f'Timer can never fire, check its config: {timer}')
+        latest = last_scheduled_action(timerlist)
+        if latest is None:
+            mainlogger.info('No auto arm/disarm timer has fired yet, keeping the restored state')
+            return
+        fire_time, timer = latest
+        armed = 1 if timer.do_arm else 0
+        state_str = 'Armed' if timer.do_arm else 'Disarmed'
+        if self.streaminfos[0]['armed'].value == armed:
+            mainlogger.info(
+                f'Startup state already correct: {timer} last fired at {fire_time}')
+            return
+        mainlogger.info(f'Startup state corrected to {state_str}: {timer} last fired at {fire_time}')
+        self.set_armed(armed)
+        # Held as an attribute so the task is not garbage collected mid-flight.
+        self.startup_notification = asyncio.create_task(self.notify_when_connected(
+            Settings.telegram_notify_arm_disarm_list,
+            f'Auto {state_str} on startup (scheduled {fire_time.strftime("%Y-%m-%d %H:%M")})'))
+
     async def auto_arm_disarm_timer(self):
         timerlist = UserSettings.auto_arm_disarm_list
         check_if_active_time = 1
+        if self.usetimer:
+            await self.apply_startup_arm_state(timerlist)
         while True:
             if self.usetimer:
                 for timer in timerlist:
                     action = timer.check_action()
                     if action is True:
                         mainlogger.info(f'{timer} triggered')
-                        self.streaminfos[0]['armed'].value = 1
+                        self.set_armed(1)
                         await self.send_best_effort(Settings.telegram_notify_arm_disarm_list, f'Auto Armed')
                     elif action is False:
                         mainlogger.info(f'{timer} triggered')
-                        self.streaminfos[0]['armed'].value = 0
+                        self.set_armed(0)
                         await self.send_best_effort(Settings.telegram_notify_arm_disarm_list, f'Auto Disarmed')
                 await asyncio.sleep(check_if_active_time)
             else:
@@ -696,7 +760,8 @@ class Telegrambot(mp.Process):
 
 if __name__ == "__main__":
     dict = {
-        0:{'armed':mp.Value('i', 1), 'alarm':mp.Value('i', 1)},
+        0:{'armed':mp.Value('i', 1), 'alarm':mp.Value('i', 1),
+           'timer_state_applied':mp.Value('i', 0)},
         1:{'armed':mp.Value('i', 1)}
     }
     bot = Telegrambot(dict, mp.Queue())
