@@ -8,6 +8,7 @@ import re
 import time
 from functools import wraps
 import multiprocessing as mp
+import threading
 import cv2
 import requests
 
@@ -16,7 +17,6 @@ from utils import mainlogger
 import logging
 from autoarm import AutoArm
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.error import TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, MessageHandler, ConversationHandler,
                           ContextTypes, filters)
 
@@ -68,6 +68,8 @@ class Telegrambot(mp.Process):
         self.streaminfos: dict = streaminfos
         self.dbupdatequeue = dbupdatequeue
         self.application: Application | None = None
+        # The Application's event loop, published by post_init while it is connected.
+        self.app_loop: asyncio.AbstractEventLoop | None = None
         self.userkeyboard = ReplyKeyboardMarkup([['/start']], is_persistent=True)
         self.adminkeyboard = ReplyKeyboardMarkup([['/start'],['/admin','exit admin']], is_persistent=True)
         self.usetimer = True
@@ -441,30 +443,51 @@ class Telegrambot(mp.Process):
             reply_markup = ReplyKeyboardRemove()
         await update.effective_message.reply_text(reply_str, reply_markup=reply_markup)
 
+    async def run_on_application(self, coro_factory, timeout=30):
+        """Await a bot call on the Application's event loop, from wherever we are.
+
+        The local logic runs on its own loop (see run_local_logic) so that arming and the
+        alarm relay work with no internet at all, but the bot itself is owned by the
+        Application's loop and must only be touched from there. Returns None when Telegram
+        is not connected: a missing notification never stops the caller.
+        """
+        app = self.application
+        loop = self.app_loop
+        if app is None or loop is None or loop.is_closed() or not app.running:
+            mainlogger.debug('Telegram is not connected, skipping notification')
+            return None
+        try:
+            if loop is asyncio.get_running_loop():
+                return await asyncio.wait_for(coro_factory(), timeout)
+            # run_coroutine_threadsafe hands the coroutine to the Application's loop and
+            # gives back a concurrent Future, which wrap_future turns into an awaitable.
+            return await asyncio.wait_for(
+                asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro_factory(), loop)),
+                timeout,
+            )
+        except Exception as e:
+            mainlogger.warning(f'Telegram call failed: {e}')
+            return None
+
     async def send_best_effort(self, chat_ids, text, reply_markup=None):
         """Notify each chat, tolerating a dropped connection.
 
-        The alarm countdown and the local relay must keep working while the internet is
-        down, so a failed notification is logged and skipped instead of aborting the caller.
         Returns the messages that were actually delivered.
         """
         msgs = []
         for chat_id in chat_ids:
-            try:
-                msgs.append(await self.application.bot.sendMessage(
-                    text=text, reply_markup=reply_markup, chat_id=chat_id))
-            except TelegramError as e:
-                mainlogger.warning(f'Could not notify {chat_id}: {e}')
+            msg = await self.run_on_application(
+                lambda cid=chat_id: self.application.bot.sendMessage(
+                    text=text, reply_markup=reply_markup, chat_id=cid))
+            if msg is not None:
+                msgs.append(msg)
         return msgs
 
-    @staticmethod
-    async def edit_best_effort(msgs, text, reply_markup=None):
+    async def edit_best_effort(self, msgs, text, reply_markup=None):
         """Edit previously sent messages, tolerating a dropped connection."""
         for msg in msgs:
-            try:
-                await msg.edit_text(text=text, reply_markup=reply_markup)
-            except TelegramError as e:
-                mainlogger.debug(f'Could not edit message in {msg.chat_id}: {e}')
+            await self.run_on_application(
+                lambda m=msg: m.edit_text(text=text, reply_markup=reply_markup))
 
     async def notify_alarm(self):
         keyboard = [
@@ -558,9 +581,22 @@ class Telegrambot(mp.Process):
                 return
 
     async def post_init(self, application: Application) -> None:
-        """Start the background loops once the Application's bot is initialized."""
-        application.create_task(self.supervise(self.notify_alarm, 'notify_alarm'))
-        application.create_task(self.supervise(self.auto_arm_disarm_timer, 'auto_arm_disarm_timer'))
+        """Publish the Application's loop so the local logic can send through it."""
+        self.app_loop = asyncio.get_running_loop()
+
+    def run_local_logic(self) -> None:
+        """Event loop for the logic that must not depend on Telegram.
+
+        Arming and firing the alarm relay are local decisions. Running them on the
+        Application's loop meant they never started at all when the bot could not reach
+        Telegram, because Application.initialize() fails before post_init runs.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(asyncio.gather(
+            self.supervise(self.notify_alarm, 'notify_alarm'),
+            self.supervise(self.auto_arm_disarm_timer, 'auto_arm_disarm_timer'),
+        ))
 
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         mainlogger.error(f'Exception while handling an update: {context.error}')
@@ -629,6 +665,9 @@ class Telegrambot(mp.Process):
         at startup. Combined with the container restart policy and the admin Restart button,
         that used to leave the process dead for good after a restart during an outage.
         """
+        # Arming and the alarm relay run on their own loop: they must keep working even
+        # while the Application below is stuck retrying a connection it cannot make.
+        threading.Thread(target=self.run_local_logic, daemon=True).start()
         backoff = 5
         while True:
             try:
@@ -650,6 +689,9 @@ class Telegrambot(mp.Process):
                 # run_polling returns normally on SIGINT/SIGTERM: a real shutdown.
                 mainlogger.info('Telegrambot shutting down')
                 return
+            finally:
+                # The loop is closed by now: stop the local logic submitting work to it.
+                self.app_loop = None
 
 
 if __name__ == "__main__":
