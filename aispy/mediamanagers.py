@@ -71,6 +71,7 @@ class SnapshotProcessor(mp.Process):
 	def run(self):
 		mainlogger.info(f'Starting snapshot process')
 		while True:
+			item = None
 			try:
 				item = self.snapshotqueue.get()
 				streamid = item[0]
@@ -86,5 +87,6 @@ class SnapshotProcessor(mp.Process):
 				send_photo_telegram(snapshot_filename, Settings.telegram_alarmlist, Settings.fractal_token, caption)
 			except:
 				mainlogger.warning(f'Problem in snapshot processor restarting in 10')
-				self.snapshotqueue.put(item)
+				if item is not None:
+					self.snapshotqueue.put(item)
 				time.sleep(10)

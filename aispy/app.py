@@ -1,3 +1,6 @@
+import threading
+import time
+
 import numpy as np
 from streams import Stream
 from settings import UserSettings, Settings
@@ -20,6 +23,7 @@ class FractalApp:
 		self.fileinferencequeue = None
 		self.dbupdatequeue = None
 		self.process_outputs = {}
+		self.telegrambot = None
 		self.init_shared_state_objects()
 
 	def init_shared_state_objects(self):
@@ -45,6 +49,24 @@ class FractalApp:
 			)
 			self.streaminfos[streamid]['motionlist'] = self.motionmanager.list([None])
 
+	def start_telegrambot(self):
+		self.telegrambot = Telegrambot(self.streaminfos, self.dbupdatequeue)
+		self.telegrambot.start()
+
+	def supervise_telegrambot(self, interval=10):
+		"""Restart the bot if its process ever exits.
+
+		Nothing else notices that it is gone: the rest of the app keeps running happily
+		without any Telegram control or notifications.
+		"""
+		while True:
+			time.sleep(interval)
+			if not self.telegrambot.is_alive():
+				mainlogger.warning(
+					f'Telegrambot exited with code {self.telegrambot.exitcode}, restarting')
+				self.telegrambot.join()
+				self.start_telegrambot()
+
 	def dbupdater(self):
 		while True:
 			self.dbupdatequeue.get()
@@ -69,9 +91,9 @@ class FractalApp:
 		for stream in self.streams.values():
 			stream.start()
 
-		# Start the telegram server
-		t = Telegrambot(self.streaminfos, self.dbupdatequeue)
-		t.start()
+		# Start the telegram server and keep it alive
+		self.start_telegrambot()
+		threading.Thread(target=self.supervise_telegrambot, daemon=True).start()
 
 		# Create and start the detector watchdog
 		watchdog = Watchdog(self.streaminfos, self.fileinferencequeue)

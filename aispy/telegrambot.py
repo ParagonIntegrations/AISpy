@@ -10,13 +10,13 @@ from functools import wraps
 import multiprocessing as mp
 import cv2
 import requests
-import telegram
 
 from settings import Settings, UserSettings
 from utils import mainlogger
 import logging
 from autoarm import AutoArm
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.error import TelegramError
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, MessageHandler, ConversationHandler,
                           ContextTypes, filters)
 
@@ -441,8 +441,32 @@ class Telegrambot(mp.Process):
             reply_markup = ReplyKeyboardRemove()
         await update.effective_message.reply_text(reply_str, reply_markup=reply_markup)
 
+    async def send_best_effort(self, chat_ids, text, reply_markup=None):
+        """Notify each chat, tolerating a dropped connection.
+
+        The alarm countdown and the local relay must keep working while the internet is
+        down, so a failed notification is logged and skipped instead of aborting the caller.
+        Returns the messages that were actually delivered.
+        """
+        msgs = []
+        for chat_id in chat_ids:
+            try:
+                msgs.append(await self.application.bot.sendMessage(
+                    text=text, reply_markup=reply_markup, chat_id=chat_id))
+            except TelegramError as e:
+                mainlogger.warning(f'Could not notify {chat_id}: {e}')
+        return msgs
+
+    @staticmethod
+    async def edit_best_effort(msgs, text, reply_markup=None):
+        """Edit previously sent messages, tolerating a dropped connection."""
+        for msg in msgs:
+            try:
+                await msg.edit_text(text=text, reply_markup=reply_markup)
+            except TelegramError as e:
+                mainlogger.debug(f'Could not edit message in {msg.chat_id}: {e}')
+
     async def notify_alarm(self):
-        bot = telegram.Bot(Settings.fractal_token)
         keyboard = [
             [InlineKeyboardButton('Cancel Alarm', callback_data=f'alarm_cancel'),
             InlineKeyboardButton('Confirm Alarm', callback_data=f'alarm_confirm')]
@@ -451,20 +475,18 @@ class Telegrambot(mp.Process):
         while True:
             if self.streaminfos[0]['alarm'].value == 1:
                 timer = 30
-                async with bot:
-                    msgs = [await bot.sendMessage(text=f'Alarm will trigger in {timer}s', reply_markup=reply_markup, chat_id=id) for id in Settings.telegram_alarmlist]
+                msgs = await self.send_best_effort(
+                    Settings.telegram_alarmlist, f'Alarm will trigger in {timer}s', reply_markup)
+                await asyncio.sleep(1)
+                while (timer > 0) and (self.streaminfos[0]['alarm'].value == 1):
+                    timer -= 1
+                    await self.edit_best_effort(msgs, f'Alarm will trigger in {timer}s', reply_markup)
                     await asyncio.sleep(1)
-                    while (timer > 0) and (self.streaminfos[0]['alarm'].value == 1):
-                        timer -= 1
-                        for msg in msgs:
-                            await msg.edit_text(text=f'Alarm will trigger in {timer}s', reply_markup=reply_markup)
-                        await asyncio.sleep(1)
-                    if self.streaminfos[0]['alarm'].value == 1:
-                        for msg in msgs:
-                            await msg.edit_text(text=f'Alarm Triggered Due to Timer Expiration')
-                        # Trigger the alarm
-                        self.streaminfos[0]['alarm'].value = 0
-                        await self.trigger_alarm()
+                if self.streaminfos[0]['alarm'].value == 1:
+                    await self.edit_best_effort(msgs, f'Alarm Triggered Due to Timer Expiration')
+                    # Trigger the alarm
+                    self.streaminfos[0]['alarm'].value = 0
+                    await self.trigger_alarm()
             await asyncio.sleep(0.2)
 
     @restricted_to_alarmuser
@@ -487,14 +509,15 @@ class Telegrambot(mp.Process):
     async def trigger_alarm(self):
         mainlogger.info('Triggering Alarm')
         try:
-            requests.get(f'http://{UserSettings.alarm_relay_ip}/cm?cmnd=Power%20On')
-        except:
-            bot = telegram.Bot(Settings.fractal_token)
-            msgs = [await bot.sendMessage(text=f'Error Triggering Alarm', chat_id=id)
-                    for id in Settings.telegram_alarmlist]
+            # The relay is on the LAN, but a blocking call with no timeout would still stall
+            # the whole event loop if it stops answering.
+            await asyncio.to_thread(
+                requests.get, f'http://{UserSettings.alarm_relay_ip}/cm?cmnd=Power%20On', timeout=5)
+        except Exception:
+            mainlogger.exception('Error Triggering Alarm')
+            await self.send_best_effort(Settings.telegram_alarmlist, f'Error Triggering Alarm')
 
     async def auto_arm_disarm_timer(self):
-        bot = telegram.Bot(Settings.fractal_token)
         timerlist = UserSettings.auto_arm_disarm_list
         check_if_active_time = 1
         while True:
@@ -502,26 +525,50 @@ class Telegrambot(mp.Process):
                 for timer in timerlist:
                     action = timer.check_action()
                     if action is True:
-                        print(f'{timer} triggered')
+                        mainlogger.info(f'{timer} triggered')
                         self.streaminfos[0]['armed'].value = 1
-                        msgs = [await bot.sendMessage(text=f'Auto Armed', chat_id=id)
-                                for id in Settings.telegram_notify_arm_disarm_list]
+                        await self.send_best_effort(Settings.telegram_notify_arm_disarm_list, f'Auto Armed')
                     elif action is False:
-                        print(f'{timer} triggered')
+                        mainlogger.info(f'{timer} triggered')
                         self.streaminfos[0]['armed'].value = 0
-                        msgs = [await bot.sendMessage(text=f'Auto Disarmed', chat_id=id)
-                                for id in Settings.telegram_notify_arm_disarm_list]
+                        await self.send_best_effort(Settings.telegram_notify_arm_disarm_list, f'Auto Disarmed')
                 await asyncio.sleep(check_if_active_time)
             else:
                 await asyncio.sleep(check_if_active_time)
 
 
-    def run(self) -> None:
-        asyncio.ensure_future(self.notify_alarm())
-        asyncio.ensure_future(self.auto_arm_disarm_timer())
-        """Run the bot."""
-        # Create the Application and pass it your bot's token.
-        self.application = Application.builder().token(Settings.fractal_token).build()
+    async def supervise(self, coro_func, description) -> None:
+        """Keep a background loop alive across failures.
+
+        These loops used to be plain fire-and-forget tasks: the first NetworkError killed
+        them for good and asyncio only reported it as an unretrieved task exception, so the
+        auto-arm timers and the alarm escalation went quiet until the next restart.
+        """
+        backoff = 1
+        while True:
+            try:
+                await coro_func()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                mainlogger.exception(f'{description} failed, restarting in {backoff}s')
+                await asyncio.sleep(backoff)
+                backoff = min(60, backoff * 2)
+            else:
+                return
+
+    async def post_init(self, application: Application) -> None:
+        """Start the background loops once the Application's bot is initialized."""
+        application.create_task(self.supervise(self.notify_alarm, 'notify_alarm'))
+        application.create_task(self.supervise(self.auto_arm_disarm_timer, 'auto_arm_disarm_timer'))
+
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        mainlogger.error(f'Exception while handling an update: {context.error}')
+
+    def build_application(self) -> Application:
+        """Build a fresh Application. Must be rebuilt per run: run_polling closes the loop."""
+        self.application = Application.builder().token(Settings.fractal_token).post_init(
+            self.post_init).build()
 
         adminconversation = ConversationHandler(
             entry_points=[
@@ -571,9 +618,38 @@ class Telegrambot(mp.Process):
         self.application.add_handler(CallbackQueryHandler(self.alarm_cancel_confirm, pattern='^alarm_.*$'))
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(MessageHandler(filters.ALL, self.help_command))
+        self.application.add_error_handler(self.error_handler)
+        return self.application
 
-        # Run the bot forever
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+    def run(self) -> None:
+        """Run the bot, retrying until the network comes back.
+
+        Application.initialize() calls get_me(), and start_polling's bootstrap defaults to
+        bootstrap_retries=0, so both raise straight out of run_polling if the link is down
+        at startup. Combined with the container restart policy and the admin Restart button,
+        that used to leave the process dead for good after a restart during an outage.
+        """
+        backoff = 5
+        while True:
+            try:
+                # run_polling closes the event loop when it returns, so each attempt needs a
+                # new one (and a new Application bound to it).
+                asyncio.set_event_loop(asyncio.new_event_loop())
+                self.build_application().run_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    # Retry the bootstrap indefinitely instead of dying on the first failure.
+                    bootstrap_retries=-1,
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                mainlogger.exception(f'Telegram application stopped, restarting in {backoff}s')
+                time.sleep(backoff)
+                backoff = min(60, backoff * 2)
+            else:
+                # run_polling returns normally on SIGINT/SIGTERM: a real shutdown.
+                mainlogger.info('Telegrambot shutting down')
+                return
 
 
 if __name__ == "__main__":

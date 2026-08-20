@@ -38,21 +38,54 @@ def create_rotating_log(path, logsize, lognum, file_level, console_level, telegr
 	return logger
 
 class TelegramRequestsHandler(Handler):
+	"""Ship log records to Telegram without ever raising into the caller.
+
+	logging.Handler.handle() does not catch exceptions raised by emit(), so a bare
+	requests.post() here used to propagate ConnectionError into every mainlogger call
+	whenever the internet was down, taking down whichever process was logging. A missing
+	timeout also meant a black-holed link could block the caller (including the bot's
+	asyncio loop) for the full OS TCP timeout.
+	"""
+
+	# (connect, read) timeout for the Telegram API call
+	post_timeout = (5, 10)
+	initial_backoff = datetime.timedelta(seconds=5)
+	max_backoff = datetime.timedelta(minutes=5)
 
 	def __init__(self, telegram_id, telegram_token):
 		super(TelegramRequestsHandler, self).__init__()
 		self.telegram_id = telegram_id
 		self.telgram_token = telegram_token
+		self.backoff = self.initial_backoff
+		self.retry_after = datetime.datetime.min
 
 	def emit(self, record):
-		log_entry = self.format(record)
-		payload = {
-			'chat_id': self.telegram_id,
-			'text': log_entry,
-			'parse_mode': 'HTML'
-		}
-		return requests.post("https://api.telegram.org/bot{token}/sendMessage".format(token=self.telgram_token),
-							 data=payload).content
+		# While the link is down, skip the post outright rather than paying the connect
+		# timeout on every single log line.
+		now = datetime.datetime.now()
+		if now < self.retry_after:
+			return None
+		try:
+			log_entry = self.format(record)
+			payload = {
+				'chat_id': self.telegram_id,
+				'text': log_entry,
+				'parse_mode': 'HTML'
+			}
+			response = requests.post(
+				"https://api.telegram.org/bot{token}/sendMessage".format(token=self.telgram_token),
+				data=payload,
+				timeout=self.post_timeout,
+			)
+		except Exception:
+			# Deliberately silent: the record is still on the file and console handlers, and
+			# logging from inside a log handler risks recursion.
+			self.retry_after = now + self.backoff
+			self.backoff = min(self.backoff * 2, self.max_backoff)
+			return None
+		self.backoff = self.initial_backoff
+		self.retry_after = datetime.datetime.min
+		return response.content
 
 class TelegramFormatter(Formatter):
 	def __init__(self):
@@ -75,9 +108,22 @@ mainlogger = create_rotating_log(Settings.log_name,
 								 Settings.telegram_token)
 
 
-def send_photo_telegram(image_path, chat_ids, token, image_caption=""):
+def send_photo_telegram(image_path, chat_ids, token, image_caption="", timeout=(5, 30)):
+	"""Best effort photo notification.
+
+	Returns True if every recipient was reached. A dropped connection is reported rather
+	than raised: the caller has already written the snapshot to disk, and retrying it
+	forever while the link is down only fills the disk with duplicates.
+	"""
+	delivered = True
 	for chat_id in chat_ids:
 		data = {"chat_id": chat_id, "caption": image_caption}
 		url = f'https://api.telegram.org/bot{token}/sendPhoto?chat_id={chat_id}'
-		with open(image_path, "rb") as image_file:
-			ret = requests.post(url, data=data, files={"photo": image_file})
+		try:
+			with open(image_path, "rb") as image_file:
+				ret = requests.post(url, data=data, files={"photo": image_file}, timeout=timeout)
+			ret.raise_for_status()
+		except Exception:
+			mainlogger.warning(f'Could not send {image_path} to {chat_id}')
+			delivered = False
+	return delivered
