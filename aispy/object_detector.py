@@ -13,15 +13,11 @@ from detector.detectors.rknn import RknnDetectorConfig
 
 class ObjectDetector(mp.Process):
 
-	def __init__(self, streaminfo: dict, fileinferencequeue: mp.Queue,
-				 snapshotqueue: mp.Queue, fileannotatorsendqueue: mp.Queue, fileannotatorreceivequeue: mp.Queue,
+	def __init__(self, streaminfo: dict, snapshotqueue: mp.Queue,
 				 updatetime: mp.Value, detectorload: mp.Value):
 		super().__init__()
 		self.streaminfos = streaminfo
-		self.fileinferencequeue = fileinferencequeue
 		self.snapshotqueue = snapshotqueue
-		self.fileannotatorsendqueue = fileannotatorsendqueue
-		self.fileannotatorreceivequeue = fileannotatorreceivequeue
 		self.avginferencetime = Settings.avg_inference_time
 		self.updatetime = updatetime
 		self.detectorload = detectorload
@@ -100,25 +96,8 @@ class ObjectDetector(mp.Process):
 							if self.streaminfos[0]['armed'].value and self.streaminfos[streamid]['armed'].value:
 								self.snapshotqueue.put((streamid, annotated_frame, f'Alarm Cleared on stream {streamid}'))
 
-					# After all frames have been processed do other detection work if there is time left
-					now = datetime.now()
-					time_left = loopstarttime + UserSettings.check_detection_time - now
-					time_left = time_left.total_seconds()
-					# Magic value obtained by trial and error
-					inferencestodo = int(time_left * 0.65 // self.avginferencetime)
-					mainlogger.debug(f'Doing {inferencestodo} inferences on video')
-					for i in range(inferencestodo):
-						if self.fileannotatorsendqueue.qsize() > 0:
-							try:
-								packet = self.fileannotatorsendqueue.get_nowait()
-							except:
-								break
-							if packet[1] == 'Done':
-								mainlogger.debug(f'Received done packet from fileannotator')
-								self.fileannotatorreceivequeue.put((None, 'Done'))
-							else:
-								inf_res = self.doinference(*packet)
-								self.fileannotatorreceivequeue.put(inf_res)
+					# Whatever is left of the interval is now simply idle. It used to
+					# be spent re-inferencing recorded clips to annotate them.
 					now = datetime.now()
 					time_left = loopstarttime + UserSettings.check_detection_time - now
 					time_left = time_left.total_seconds()
@@ -136,22 +115,16 @@ class ObjectDetector(mp.Process):
 
 
 	def zone_for(self, streamid, frame) -> sv.PolygonZone:
-		"""The detect area in the coordinate space of the frame we were handed.
+		"""The detect area in the coordinate space of the frames we are handed.
 
-		Live frames come off the detection stream, which may be the camera's
-		substream, while the FileAnnotator's come from the recorded clip at full
-		size. Zones are cached per frame size because building one rasterises a mask
-		as big as the frame, which is not work to repeat on every inference.
+		Cached because building a PolygonZone rasterises a mask as big as the whole
+		frame, which is not work to repeat on every single inference.
 		"""
 		height, width = frame.shape[:2]
 		key = (streamid, width, height)
 		if key not in self.zones:
 			streaminfo = self.streaminfos[streamid]
-			detect_dimensions = tuple(streaminfo.get('detect_dimensions') or streaminfo['dimensions'])
-			if (width, height) == detect_dimensions:
-				polygon = streaminfo.get('detect_detectarea', streaminfo['detectarea'])
-			else:
-				polygon = streaminfo['detectarea']
+			polygon = streaminfo.get('detect_detectarea', streaminfo['detectarea'])
 			self.zones[key] = sv.PolygonZone(polygon, (width, height))
 		return self.zones[key]
 

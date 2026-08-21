@@ -25,13 +25,12 @@ class SegmentRecorder:
 
 	An event is the span where the detector holds recordflag at 1. When it clears,
 	the segments covering [event start - pre_record_time, event end] are concatenated
-	into a single clip - '-c copy' again - and handed to the FileAnnotator.
+	into a single clip - '-c copy' again.
 	"""
 
-	def __init__(self, streamid, streaminfo, fileannotatorqueue):
+	def __init__(self, streamid, streaminfo):
 		self.streamid = streamid
 		self.streaminfo = streaminfo
-		self.fileannotatorqueue = fileannotatorqueue
 		self.ffmpeg = optional_setting('ffmpeg_path', 'ffmpeg')
 		self.ffprobe = optional_setting('ffprobe_path', 'ffprobe')
 		# Requested segment length. '-c copy' can only cut on a keyframe, so a segment
@@ -204,7 +203,6 @@ class SegmentRecorder:
 			mainlogger.info(
 				f'Recording segment on {self.streamid} done, '
 				f'{len(paths)} segments -> {outfilename}')
-			self.fileannotatorqueue.put((self.streamid, outfilename))
 
 	# -- the event collector -------------------------------------------------
 

@@ -1,80 +1,9 @@
-import math
-import pathlib
 import time
 from datetime import datetime
 import cv2
 import multiprocessing as mp
-from settings import UserSettings, Settings
-from utils import mainlogger, send_photo_telegram
-
-class FileAnnotator(mp.Process):
-	def __init__(self, sendqueue: mp.Queue, receivequeue: mp.Queue, ordersqueue: mp.Queue, streaminfos):
-		super().__init__()
-		self.sendqueue = sendqueue
-		self.receivequeue = receivequeue
-		self.ordersqueue = ordersqueue
-		self.streaminfos = streaminfos
-
-	def run(self):
-		mainlogger.info(f'Fileannotator starting')
-		working = False
-		while True:
-			try:
-				if not working:
-					order = self.ordersqueue.get()
-					working = True
-					streamid = order[0]
-					infilepath = pathlib.Path(order[1])
-					infilename = infilepath.name
-					mainlogger.info(f'Starting inference on {infilename} from stream {streamid}')
-					outfilepath = Settings.annotatedvideodir.joinpath(str(streamid))
-					outfilepath.mkdir(parents=True,exist_ok=True)
-					outfilename = str(outfilepath.joinpath(infilename))
-					cap = cv2.VideoCapture(order[1])
-					# Clips are remuxed straight from the camera now, so they run at the
-					# camera's frame rate rather than at record_fps. Taking it from the
-					# file keeps the annotated copy in step with the original.
-					fps = cap.get(cv2.CAP_PROP_FPS)
-					if not math.isfinite(fps) or not 0 < fps <= 120:
-						fps = UserSettings.record_fps
-					# A remuxed clip also keeps the camera's narrow frames, so they get
-					# widened here the same way the capture side widens them - the
-					# detect area the detector applies is in widened coordinates.
-					lite_aspect_ratio = self.streaminfos[streamid].get('lite_aspect_ratio')
-					fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-					out = cv2.VideoWriter(outfilename, fourcc, fps, tuple(self.streaminfos[streamid]['dimensions']))
-				if working:
-					while cap.isOpened():
-						check, frame = cap.read()
-						if check:
-							if lite_aspect_ratio:
-								frame = frame.repeat(2, 1)
-							if self.sendqueue.qsize() <= 100:
-								self.sendqueue.put((frame, streamid))
-							else:
-								break
-						else:
-							mainlogger.debug(f'All video frames placed on queue')
-							self.sendqueue.put((None, 'Done'))
-							cap.release()
-					qsize = self.receivequeue.qsize()
-					for i in range(qsize):
-						try:
-							packet = self.receivequeue.get_nowait()
-						except:
-							break
-						if packet[1] == 'Done':
-							out.release()
-							working = False
-							mainlogger.info(f'Inference on {infilename} from stream {streamid} done')
-						else:
-							out.write(packet[0])
-					time.sleep(0.1)
-			except:
-				mainlogger.exception(f'Problem with fileannotator restarting in 10')
-				self.ordersqueue.put(order)
-				working = False
-				time.sleep(10)
+from settings import Settings
+from utils import mainlogger, optional_setting, send_photo_telegram
 
 class SnapshotProcessor(mp.Process):
 	def __init__(self, snapshotqueue: mp.Queue):
@@ -94,8 +23,11 @@ class SnapshotProcessor(mp.Process):
 				snapshot_dir.mkdir(parents=True, exist_ok=True)
 				datetimestr = datetime.now().strftime("%Y%m%d_%H%M%S")
 				if caption == None: caption = datetimestr
-				snapshot_filename = str(snapshot_dir.joinpath(f'{datetimestr}.png'))
-				cv2.imwrite(snapshot_filename,frame)
+				# JPEG rather than PNG: encoding a full frame as PNG costs an order of
+				# magnitude more CPU, and Telegram recompresses photos either way.
+				quality = int(optional_setting('snapshot_jpeg_quality', 90))
+				snapshot_filename = str(snapshot_dir.joinpath(f'{datetimestr}.jpg'))
+				cv2.imwrite(snapshot_filename, frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
 				# Send the photo to telegram
 				send_photo_telegram(snapshot_filename, Settings.telegram_alarmlist, Settings.fractal_token, caption)
 			except:

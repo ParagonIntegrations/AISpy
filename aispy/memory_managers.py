@@ -1,6 +1,7 @@
 import collections
 import datetime
 import multiprocessing as mp
+import os
 from threading import RLock
 from multiprocessing.shared_memory import SharedMemory
 
@@ -19,24 +20,39 @@ class SharedFrameDeque:
 		self.head: mp.Value = mp.Value('I', 0)
 		self.tail: mp.Value = mp.Value('I', 0)
 		self.num_items: mp.Value = mp.Value('I', 0)
+		self.owner_pid: int = os.getpid()
+		self._frames: np.ndarray | None = None
+		self._frames_pid: int | None = None
+
+	@property
+	def frames(self) -> np.ndarray:
+		"""The whole ring as one numpy array, so frames can be copied in and out directly.
+
+		Rebuilt whenever the pid changes so it always refers to this process's own
+		mapping of the shared segment rather than one inherited across a fork.
+		"""
+		if self._frames is None or self._frames_pid != os.getpid():
+			self._frames = np.ndarray((self.max_items,) + tuple(self.itemshape),
+									  dtype=self.datatype, buffer=self.memory.buf)
+			self._frames_pid = os.getpid()
+		return self._frames
 
 	def pop(self) -> np.ndarray:
 		with self.lock:
 			if self.num_items:
 				self.num_items.value -= 1
 				self.tail.value = (self.tail.value - 1 + self.max_items) % self.max_items
-				mbuf = bytearray(self.memory.buf[self.memtail:self.memtail + self.itemsize])
-				return np.ndarray((self.itemshape), dtype=self.datatype, buffer=mbuf)
+				return self.frames[self.tail.value].copy()
 			else:
 				raise IndexError('Pop from empty SharedDeque')
 
 	def popleft(self) -> np.ndarray:
 		with self.lock:
 			if self.num_items.value:
-				mbuf = bytearray(self.memory.buf[self.memhead:self.memhead + self.itemsize])
+				item = self.frames[self.head.value].copy()
 				self.num_items.value -= 1
 				self.head.value = (self.head.value + 1) % self.max_items
-				return np.ndarray((self.itemshape), dtype=self.datatype, buffer=mbuf, )
+				return item
 			else:
 				raise IndexError('Pop from empty SharedDeque')
 
@@ -46,7 +62,9 @@ class SharedFrameDeque:
 				raise ValueError('Wrong item datatype')
 			if item.shape != self.itemshape:
 				raise ValueError('Wrong item shape')
-			self.memory.buf[self.memtail:self.memtail + self.itemsize] = item.tobytes()
+			# Straight into the ring. item.tobytes() used to allocate and fill an entire
+			# extra copy of the frame, which the assignment then copied again.
+			np.copyto(self.frames[self.tail.value], item)
 			if self.num_items.value < self.max_items:
 				self.num_items.value += 1
 				self.tail.value = (self.tail.value + 1) % self.max_items
@@ -67,7 +85,7 @@ class SharedFrameDeque:
 			else:
 				self.head.value = (self.head.value - 1 + self.max_items) % self.max_items
 				self.tail.value = self.head.value
-			self.memory.buf[self.memhead:self.memhead + self.itemsize] = item
+			np.copyto(self.frames[self.head.value], item)
 			return
 
 	def getbyarrayindex(self, arrayindex) -> np.ndarray:
@@ -76,8 +94,7 @@ class SharedFrameDeque:
 			if arrayindex > self.max_items:
 				IndexError(f'Cannot access item SharedDeque is only {self.max_items} long')
 			arrayindex = (arrayindex + self.max_items) % self.max_items
-			mbuf = bytearray(self.memory.buf[self.memaddr(arrayindex):self.memaddr(arrayindex + 1)])
-			return np.ndarray(self.itemshape, dtype=self.datatype, buffer=mbuf)
+			return self.frames[arrayindex].copy()
 
 	def getwithindex(self, key) -> tuple[np.ndarray, int]:
 		return self.__getitem__(key, True)
@@ -103,16 +120,15 @@ class SharedFrameDeque:
 					IndexError(f'Cannot access item {key}, only {self.num_items.value} in SharedDeque')
 				if key >= 0:
 					keyindex = (self.head.value + key) % self.max_items
-					mbuf = bytearray(self.memory.buf[self.memaddr(keyindex):self.memaddr(keyindex + 1)])
 				else:
 					keyindex = (self.tail.value + self.max_items + key) % self.max_items
-					mbuf = bytearray(self.memory.buf[self.memaddr(keyindex):self.memaddr(keyindex + 1)])
+				item = self.frames[keyindex].copy()
 			else:
 				raise TypeError('Invalid argument type')
 
 			if withindex:
-				return np.ndarray(self.itemshape, dtype=self.datatype, buffer=mbuf), keyindex
-			return np.ndarray(self.itemshape, dtype=self.datatype, buffer=mbuf)
+				return item, keyindex
+			return item
 
 	def __len__(self):
 		with self.lock:
@@ -120,7 +136,10 @@ class SharedFrameDeque:
 
 	def __del__(self):
 		self.memory.close()
-		self.memory.unlink()
+		# Only the process that created the segment may remove it. A forked child
+		# unlinking on its way out would pull the buffer from under everyone else.
+		if self.owner_pid == os.getpid():
+			self.memory.unlink()
 
 class MotionDetectorSharedMemory:
 	def __init__(self, max_items):

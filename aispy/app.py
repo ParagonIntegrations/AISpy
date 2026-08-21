@@ -20,14 +20,12 @@ class FractalApp:
 		self.streams = {}
 		# self.recordflags = {}
 		self.streaminfos = self.db.load_state()
-		self.fileinferencequeue = None
 		self.dbupdatequeue = None
 		self.process_outputs = {}
 		self.telegrambot = None
 		self.init_shared_state_objects()
 
 	def init_shared_state_objects(self):
-		self.fileinferencequeue = mp.Queue()
 		self.dbupdatequeue = mp.Queue()
 		self.motionmanager = mp.Manager()
 		# TODO use these in the process
@@ -60,10 +58,10 @@ class FractalApp:
 	def init_detect_geometry(self, streamid):
 		"""Work out the frame size and detect area the detector will actually see.
 
-		A stream can point detection at the camera's substream via 'detect_url'. When
-		that substream is a different size, 'detect_dimensions' describes it and the
-		detect area is scaled into those coordinates - the full-size polygon is still
-		needed for the FileAnnotator, which works on the recorded clip.
+		The decoder scales whatever it is given to 'detect_dimensions', so this is a
+		free choice rather than a property of the source: smaller means fewer bytes
+		down the pipe and a smaller frame buffer. The detect area is written against
+		'dimensions', so it is scaled into those coordinates here.
 		"""
 		streaminfo = self.streaminfos[streamid]
 		dimensions = tuple(streaminfo['dimensions'])
@@ -114,7 +112,7 @@ class FractalApp:
 		for streamid in UserSettings.streaminfo.keys():
 			if streamid == 0:
 				continue
-			stream = Stream(streamid, self.streaminfos[streamid], self.fileinferencequeue)
+			stream = Stream(streamid, self.streaminfos[streamid])
 			self.streams[streamid] = stream
 		# Start the streams
 		for stream in self.streams.values():
@@ -125,7 +123,7 @@ class FractalApp:
 		threading.Thread(target=self.supervise_telegrambot, daemon=True).start()
 
 		# Create and start the detector watchdog
-		watchdog = Watchdog(self.streaminfos, self.fileinferencequeue)
+		watchdog = Watchdog(self.streaminfos)
 		watchdog.start()
 
 		# Start the dbupdater

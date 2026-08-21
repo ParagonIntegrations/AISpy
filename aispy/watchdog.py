@@ -2,19 +2,16 @@ import multiprocessing as mp
 import threading
 import time
 from object_detector import ObjectDetector
-from mediamanagers import FileAnnotator, SnapshotProcessor
+from mediamanagers import SnapshotProcessor
 from utils import mainlogger
 
 
 class Watchdog(threading.Thread):
 
-	def __init__(self, streaminfo: dict, fileinferencequeue: mp.Queue):
+	def __init__(self, streaminfo: dict):
 		super().__init__()
 		self.streaminfos = streaminfo
-		self.fileinferencequeue = fileinferencequeue
 		self.snapshotqueue = mp.Queue()
-		self.fileannotatorsendqueue = mp.Queue()
-		self.fileannotatorreceivequeue = mp.Queue()
 		self.updatetime = mp.Value('d', 0.0)
 		self.detectorload = mp.Value('d', 0.0)
 		self.processes = []
@@ -23,19 +20,9 @@ class Watchdog(threading.Thread):
 		mainlogger.info(f'Watchdog starting processes')
 		snap = SnapshotProcessor(self.snapshotqueue)
 		self.processes.append(snap)
-		fileanno = FileAnnotator(
-			self.fileannotatorsendqueue,
-			self.fileannotatorreceivequeue,
-			self.fileinferencequeue,
-			self.streaminfos
-		)
-		self.processes.append(fileanno)
 		detect = ObjectDetector(
 			self.streaminfos,
-			self.fileinferencequeue,
 			self.snapshotqueue,
-			self.fileannotatorsendqueue,
-			self.fileannotatorreceivequeue,
 			self.updatetime,
 			self.detectorload
 		)
