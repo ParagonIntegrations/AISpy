@@ -1,3 +1,4 @@
+import re
 import subprocess
 import threading
 import time
@@ -35,33 +36,72 @@ class FfmpegDecoder:
 		self.ffmpeg = optional_setting('ffmpeg_path', 'ffmpeg')
 		self.variants = list(optional_setting('detect_decode_variants', DECODE_VARIANTS))
 		self.variant = None
+		self.mismatch = threading.Event()
 
 	def cmd(self, variant) -> list:
-		args = [self.ffmpeg, '-hide_banner', '-loglevel', 'warning', '-nostdin']
+		# -nostats keeps the progress spam out, but info level is wanted: it is what
+		# prints the output stream line that check_output_size reads.
+		args = [self.ffmpeg, '-hide_banner', '-loglevel', 'info', '-nostats', '-nostdin']
+		# scale_rkrga defaults force_original_aspect_ratio to 'decrease', unlike the
+		# software scale filter. Left alone it would refuse to widen an anamorphic
+		# stream and hand back the source size instead.
+		exact = 'force_original_aspect_ratio=disable'
 		if variant == 'rkmpp_rga':
 			# Frames stay in DRM prime buffers from the decoder through the scaler and
 			# are only copied to system memory at the very end.
 			args += ['-hwaccel', 'rkmpp', '-hwaccel_output_format', 'drm_prime']
 			videofilter = (f'fps={self.fps},'
-						   f'scale_rkrga=w={self.width}:h={self.height}:format=bgr24,'
+						   f'scale_rkrga=w={self.width}:h={self.height}:format=bgr24:{exact},'
 						   f'hwdownload,format=bgr24')
 		elif variant == 'rkmpp':
 			# VPU decode, but let ffmpeg hand back software frames and scale them on
 			# the CPU. Slower than the RGA path, still far cheaper than decoding here.
 			args += ['-hwaccel', 'rkmpp']
-			videofilter = f'fps={self.fps},scale={self.width}:{self.height}'
+			videofilter = f'fps={self.fps},scale=w={self.width}:h={self.height}:{exact}'
 		else:
-			videofilter = f'fps={self.fps},scale={self.width}:{self.height}'
+			videofilter = f'fps={self.fps},scale=w={self.width}:h={self.height}:{exact}'
 		args += ['-rtsp_transport', 'tcp', '-i', self.url,
 				 '-an', '-vf', videofilter,
 				 '-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1']
 		return args
 
 	def log_stderr(self, process):
-		"""Drain ffmpeg's stderr; it blocks once the pipe fills."""
+		"""Drain ffmpeg's stderr; it blocks once the pipe fills.
+
+		Logged at info so the console shows which decoder and filters a stream settled
+		on, without filling the log file on every reconnect.
+		"""
+		in_output = False
 		for line in process.stderr:
-			mainlogger.warning(
-				f'Stream {self.streamid} decoder: {line.decode(errors="replace").strip()}')
+			text = line.decode(errors='replace').strip()
+			if text.startswith('Output #'):
+				in_output = True
+			elif in_output and 'Video:' in text:
+				in_output = False
+				self.check_output_size(text, process)
+			mainlogger.info(f'Stream {self.streamid} decoder: {text}')
+
+	def check_output_size(self, text, process):
+		"""Make sure ffmpeg is emitting the size we are cutting frames at.
+
+		Raw video carries no header, so frames come out of the pipe purely by byte
+		count. A filter that quietly returns a different size would leave every frame
+		after the first misaligned, which is far better to fail on than to detect on.
+		"""
+		match = re.search(r'\b(\d{2,5})x(\d{2,5})\b', text)
+		if match is None:
+			return
+		emitted = (int(match.group(1)), int(match.group(2)))
+		if emitted != (self.width, self.height):
+			mainlogger.error(
+				f'Stream {self.streamid} decoder is emitting {emitted[0]}x{emitted[1]} '
+				f'but frames are being read as {self.width}x{self.height}; stopping it')
+			# Set before killing: the reader has to stop on the flag rather than on the
+			# pipe closing, or it would hand on whatever misaligned bytes are in flight.
+			self.mismatch.set()
+			# Do not stay on a variant that cannot size its output.
+			self.variant = None
+			process.kill()
 
 	def read_frame(self, stream) -> bytes | None:
 		"""Read exactly one frame's worth of bytes, or None at end of stream."""
@@ -79,6 +119,7 @@ class FfmpegDecoder:
 		"""Run one ffmpeg until it stops. True if it ever delivered a frame."""
 		delivered = False
 		process = None
+		self.mismatch.clear()
 		try:
 			cmd = self.cmd(variant)
 			mainlogger.debug(f'Stream {self.streamid} decoder: {" ".join(cmd)}')
@@ -86,7 +127,7 @@ class FfmpegDecoder:
 			threading.Thread(target=self.log_stderr, args=(process,), daemon=True).start()
 			while True:
 				buffer = self.read_frame(process.stdout)
-				if buffer is None:
+				if buffer is None or self.mismatch.is_set():
 					break
 				if not delivered:
 					delivered = True
@@ -99,7 +140,7 @@ class FfmpegDecoder:
 			if process is not None:
 				process.kill()
 				process.wait()
-		return delivered
+		return delivered and not self.mismatch.is_set()
 
 	def run(self, sink):
 		"""Decode forever, handing every frame to `sink`.
