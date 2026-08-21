@@ -7,9 +7,21 @@ from logging.handlers import RotatingFileHandler
 import telegram
 from telegram import InlineKeyboardButton
 
-from settings import Settings
+from settings import Settings, UserSettings
 import requests
 import datetime
+
+def optional_setting(name, default):
+	"""Look a setting up in UserSettings, then Settings, then fall back to a default.
+
+	settings.py is per-device and deliberately not in the repo, so a new knob has to
+	behave sensibly before anyone has added it there.
+	"""
+	for source in (UserSettings, Settings):
+		if hasattr(source, name):
+			return getattr(source, name)
+	return default
+
 
 # Create a rotating logger
 def create_rotating_log(path, logsize, lognum, file_level, console_level, telegram_level, telegram_id, telegram_token):

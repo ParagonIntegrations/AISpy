@@ -4,7 +4,7 @@ import time
 import numpy as np
 from streams import Stream
 from settings import UserSettings, Settings
-from utils import mainlogger
+from utils import mainlogger, optional_setting
 from db_driver import DBDriver
 from telegrambot import Telegrambot
 from watchdog import Watchdog
@@ -45,12 +45,38 @@ class FractalApp:
 				continue
 			# self.recordflags[streamid] = mp.Value('i', 0)
 			self.streaminfos[streamid]['recordflag'] = mp.Value('i', 0)
+			self.init_detect_geometry(streamid)
+			# The pre-record window lives on disk as ffmpeg segments now, so this only
+			# has to hold a few recent frames for the detector instead of
+			# pre_record_time * record_fps of them.
+			detect_dimensions = self.streaminfos[streamid]['detect_dimensions']
 			self.streaminfos[streamid]['framebuffer'] = SharedFrameDeque(
-				max_items=int(UserSettings.pre_record_time.total_seconds() * UserSettings.record_fps),
-				itemshape=(self.streaminfos[streamid]['dimensions'][1], self.streaminfos[streamid]['dimensions'][0], 3),
+				max_items=int(optional_setting('detect_buffer_frames', 8)),
+				itemshape=(detect_dimensions[1], detect_dimensions[0], 3),
 				datatype=np.uint8
 			)
 			self.streaminfos[streamid]['motionlist'] = self.motionmanager.list([None])
+
+	def init_detect_geometry(self, streamid):
+		"""Work out the frame size and detect area the detector will actually see.
+
+		A stream can point detection at the camera's substream via 'detect_url'. When
+		that substream is a different size, 'detect_dimensions' describes it and the
+		detect area is scaled into those coordinates - the full-size polygon is still
+		needed for the FileAnnotator, which works on the recorded clip.
+		"""
+		streaminfo = self.streaminfos[streamid]
+		dimensions = tuple(streaminfo['dimensions'])
+		detect_dimensions = tuple(streaminfo.get('detect_dimensions') or dimensions)
+		streaminfo['detect_dimensions'] = detect_dimensions
+		if detect_dimensions == dimensions:
+			streaminfo['detect_detectarea'] = streaminfo['detectarea']
+			return
+		scale = np.array([detect_dimensions[0] / dimensions[0],
+						  detect_dimensions[1] / dimensions[1]])
+		streaminfo['detect_detectarea'] = (streaminfo['detectarea'] * scale).astype(int)
+		mainlogger.info(
+			f'Stream {streamid} detecting on {detect_dimensions} and recording {dimensions}')
 
 	def start_telegrambot(self):
 		self.telegrambot = Telegrambot(self.streaminfos, self.dbupdatequeue)

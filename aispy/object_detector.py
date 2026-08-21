@@ -26,6 +26,7 @@ class ObjectDetector(mp.Process):
 		self.updatetime = updatetime
 		self.detectorload = detectorload
 		self.model: DetectorAPI | None = None
+		self.zones = {}
 		self.boxannotator = sv.BoxAnnotator(
 			thickness=2,
 			text_thickness=2,
@@ -134,17 +135,36 @@ class ObjectDetector(mp.Process):
 				time.sleep(10)
 
 
+	def zone_for(self, streamid, frame) -> sv.PolygonZone:
+		"""The detect area in the coordinate space of the frame we were handed.
+
+		Live frames come off the detection stream, which may be the camera's
+		substream, while the FileAnnotator's come from the recorded clip at full
+		size. Zones are cached per frame size because building one rasterises a mask
+		as big as the frame, which is not work to repeat on every inference.
+		"""
+		height, width = frame.shape[:2]
+		key = (streamid, width, height)
+		if key not in self.zones:
+			streaminfo = self.streaminfos[streamid]
+			detect_dimensions = tuple(streaminfo.get('detect_dimensions') or streaminfo['dimensions'])
+			if (width, height) == detect_dimensions:
+				polygon = streaminfo.get('detect_detectarea', streaminfo['detectarea'])
+			else:
+				polygon = streaminfo['detectarea']
+			self.zones[key] = sv.PolygonZone(polygon, (width, height))
+		return self.zones[key]
+
 	def doinference(self, frame, streamid, double_check=True, motion_detections=None) -> tuple:
 		starttime = datetime.now().timestamp()
+		confidence = self.streaminfos[streamid]['confidence_threshold']
+		classes = self.streaminfos[streamid]['detection_classes']
 		if motion_detections is None:
-			confidence = self.streaminfos[streamid]['confidence_threshold']
-			classes = self.streaminfos[streamid]['detection_classes']
 			detections = self.model.detect(frame, classes=classes, conf=confidence,
 										nms=True, iou=0.5, verbose=False)
 		else:
 			detections = motion_detections
-		zone = sv.PolygonZone(self.streaminfos[streamid]['detectarea'],
-							  self.streaminfos[streamid]['dimensions'])
+		zone = self.zone_for(streamid, frame)
 		zone_detections = detections[zone.trigger(detections=detections)]
 		# Zoom in and recheck if an object is found
 		if zone_detections and double_check:
@@ -154,9 +174,9 @@ class ObjectDetector(mp.Process):
 				dx = x2 - x1
 				dy = y2 - y1
 				newx1 = int(max((x1 - dx*0.3), 0))
-				newx2 = int(min((x2 + dx*0.3), self.streaminfos[streamid]['dimensions'][0]))
+				newx2 = int(min((x2 + dx*0.3), frame.shape[1]))
 				newy1 = int(max((y1 - dy*0.3), 0))
-				newy2 = int(min((y2 + dy*0.3), self.streaminfos[streamid]['dimensions'][1]))
+				newy2 = int(min((y2 + dy*0.3), frame.shape[0]))
 				newframe: np.ndarray = frame[newy1:newy2,newx1:newx2]
 				new_detections = self.model.detect(newframe, classes=classes, conf=confidence,
 									nms=True, iou=0.5, verbose=False)

@@ -74,6 +74,21 @@ ARG APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=DontWarn
 # Install dependencies
 
 
+# ffmpeg with Rockchip hardware acceleration. Recording only remuxes with -c copy
+# so it needs no hwaccel at all, but this is the same build Frigate uses on RK3588
+# and it carries nyanmisaka's rkmpp decoders/encoders and rkrga filters for the
+# detect-side decode. Building it from source would mean compiling MPP and RGA too.
+ARG JELLYFIN_FFMPEG_VERSION=7.1.4-3
+RUN apt-get -qq update \
+    && apt-get -qq install -y --no-install-recommends wget ca-certificates \
+    && wget -q -O /tmp/jellyfin-ffmpeg.deb \
+       "https://repo.jellyfin.org/files/ffmpeg/debian/latest-7.x/arm64/jellyfin-ffmpeg7_${JELLYFIN_FFMPEG_VERSION}-bookworm_arm64.deb" \
+    && apt-get -qq install -y --no-install-recommends /tmp/jellyfin-ffmpeg.deb \
+    && ln -sf /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg \
+    && ln -sf /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
+    && rm -f /tmp/jellyfin-ffmpeg.deb \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy Virtualenvironment
 COPY --from=rk-venv /opt/virtualenvs/aispy /opt/virtualenvs/aispy
 

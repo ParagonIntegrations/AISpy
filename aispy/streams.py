@@ -1,9 +1,9 @@
 import os
 import time
-from datetime import datetime
-from settings import UserSettings, Settings
-from utils import mainlogger
+
+from utils import mainlogger, optional_setting
 from memory_managers import SharedFrameDeque
+from recorder import SegmentRecorder
 import cv2
 import multiprocessing as mp
 import threading
@@ -14,81 +14,57 @@ class Stream(mp.Process):
 		mainlogger.debug(f'Stream {id} initializing')
 		self.streamid = id
 		self.streaminfo = stream_info
-		self.fileannotatorqueue = fileannotatorqueue
 		self.framebuffer: SharedFrameDeque = self.streaminfo['framebuffer']
 		self.video = None
-		self.recorddir = Settings.videodir.joinpath(str(self.streamid))
-		self.recorddir.mkdir(parents=True, exist_ok=True)
-		self.out: cv2.VideoWriter | None = None
+		self.recorder = SegmentRecorder(id, stream_info, fileannotatorqueue)
+		# Detection can run off the camera's substream: a quarter of the pixels is a
+		# quarter of the decode, and the detector letterboxes down to 320x320 anyway.
+		self.detect_url = self.streaminfo.get('detect_url') or self.streaminfo['url']
+		# Frames are only appended this often. The buffer exists to keep one recent
+		# frame ready for the detector, which wakes every check_detection_time - it is
+		# no longer the pre-record ring, so appending at record_fps was copying
+		# megabytes per frame that nothing would ever read.
+		self.detect_fps = float(optional_setting('detect_fps', 5))
 
 	def run(self):
 		mainlogger.info(f'Stream {self.streamid} starting with pid {os.getpid()}')
-		recorder_worker = threading.Thread(target=self.recorder)
-		recorder_worker.start()
+		threading.Thread(target=self.recorder.run_ffmpeg, daemon=True).start()
+		threading.Thread(target=self.recorder.collector, daemon=True).start()
+		self.capture()
+
+	def capture(self):
+		"""Decode the detection stream into the frame buffer.
+
+		Recording does not come from here any more - ffmpeg remuxes the camera's own
+		stream straight to disk - so this only has to keep the buffer's newest frame
+		fresh for the detector. Frames are still read at full rate, because not
+		draining the RTSP receive queue just builds latency, but only appended at
+		detect_fps.
+		"""
 		while True:
 			try:
 				mainlogger.info(f'Starting capture on stream {self.streamid}')
-				self.video = cv2.VideoCapture(self.streaminfo['url'])
-				now = datetime.now().timestamp()
-				missed_frames = 0
+				self.video = cv2.VideoCapture(self.detect_url)
+				interval = 1 / self.detect_fps
+				nextframe = 0.0
 				while True:
 					check, frame = self.video.read()
+					if not check:
+						mainlogger.warning(
+							f'Stream {self.streamid} returned no frame, reconnecting in 10 seconds')
+						break
+					now = time.monotonic()
+					if now < nextframe:
+						continue
+					nextframe = now + interval
 					if self.streaminfo['lite_aspect_ratio']:
-						frame = frame.repeat(2,1)
-					if check == False:
-						mainlogger.warning('Video Not Found. Please Enter a Valid Path (Full path of Video Should be Provided).')
-						return
-					# Place the correct number of frames on the buffer
-					prev = now
-					now = datetime.now().timestamp()
-					dt = now-prev
-					missed_frames += dt/(1/UserSettings.record_fps)
-					frames_to_place = int(missed_frames//1)
-					missed_frames -= frames_to_place
-					for i in range(frames_to_place):
-						self.framebuffer.append(frame)
-			except:
-				mainlogger.warning(f'Exception on stream {self.streamid} restarting in 10 seconds')
-				time.sleep(10)
-
-	def recorder(self):
-		mainlogger.info(f'Recorder thread started for {self.streamid}')
-		recording = False
-		while True:
-			try:
-				while True:
-					while self.streaminfo['recordflag'].value == 1:
-						if len(self.framebuffer) > 0:
-							frame = self.framebuffer.popleft()
-						else:
-							time.sleep(2)
-							continue
-						# Init the recording if it is not yet
-						if self.out is None:
-							recording = True
-							mainlogger.info(f'Recording on {self.streamid} started')
-							now = datetime.now()
-							filename = str(self.recorddir.joinpath(f'{now.strftime("%Y%m%d_%H%M%S")}.mp4'))
-							fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-							# fourcc = cv2.VideoWriter_fourcc(*'H264')
-							self.out = cv2.VideoWriter(filename, fourcc, UserSettings.record_fps, self.streaminfo['dimensions'])
-						self.out.write(frame)
-						if datetime.now() >= now + UserSettings.max_clip_length:
-							recording = False
-							mainlogger.info(f'Recording segment on {self.streamid} done')
-							if self.out is not None:
-								self.out.release()
-								self.out = None
-							self.fileannotatorqueue.put((self.streamid, filename))
-					if recording:
-						recording = False
-						mainlogger.info(f'Recording on {self.streamid} done')
-						if self.out is not None:
-							self.out.release()
-							self.out = None
-						self.fileannotatorqueue.put((self.streamid, filename))
-					time.sleep(2)
-			except:
-				mainlogger.warning(f'Error on stream {self.streamid} recorder restarting in 10')
-				time.sleep(10)
-
+						frame = frame.repeat(2, 1)
+					self.framebuffer.append(frame)
+			except Exception:
+				mainlogger.exception(
+					f'Exception on stream {self.streamid}, restarting in 10 seconds')
+			finally:
+				if self.video is not None:
+					self.video.release()
+					self.video = None
+			time.sleep(10)

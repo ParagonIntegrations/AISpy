@@ -1,3 +1,4 @@
+import math
 import pathlib
 import time
 from datetime import datetime
@@ -29,13 +30,25 @@ class FileAnnotator(mp.Process):
 					outfilepath = Settings.annotatedvideodir.joinpath(str(streamid))
 					outfilepath.mkdir(parents=True,exist_ok=True)
 					outfilename = str(outfilepath.joinpath(infilename))
-					fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-					out = cv2.VideoWriter(outfilename, fourcc, UserSettings.record_fps, self.streaminfos[streamid]['dimensions'])
 					cap = cv2.VideoCapture(order[1])
+					# Clips are remuxed straight from the camera now, so they run at the
+					# camera's frame rate rather than at record_fps. Taking it from the
+					# file keeps the annotated copy in step with the original.
+					fps = cap.get(cv2.CAP_PROP_FPS)
+					if not math.isfinite(fps) or not 0 < fps <= 120:
+						fps = UserSettings.record_fps
+					# A remuxed clip also keeps the camera's narrow frames, so they get
+					# widened here the same way the capture side widens them - the
+					# detect area the detector applies is in widened coordinates.
+					lite_aspect_ratio = self.streaminfos[streamid].get('lite_aspect_ratio')
+					fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+					out = cv2.VideoWriter(outfilename, fourcc, fps, tuple(self.streaminfos[streamid]['dimensions']))
 				if working:
 					while cap.isOpened():
 						check, frame = cap.read()
 						if check:
+							if lite_aspect_ratio:
+								frame = frame.repeat(2, 1)
 							if self.sendqueue.qsize() <= 100:
 								self.sendqueue.put((frame, streamid))
 							else:
