@@ -3,12 +3,14 @@ from datetime import datetime
 import cv2
 import multiprocessing as mp
 from settings import Settings
-from utils import mainlogger, optional_setting, send_photo_telegram
+from settings_store import get_store
+from utils import mainlogger, send_photo_telegram
 
 class SnapshotProcessor(mp.Process):
 	def __init__(self, snapshotqueue: mp.Queue):
 		super().__init__()
 		self.snapshotqueue = snapshotqueue
+		self.settings = get_store()
 
 	def run(self):
 		mainlogger.info(f'Starting snapshot process')
@@ -25,11 +27,12 @@ class SnapshotProcessor(mp.Process):
 				if caption == None: caption = datetimestr
 				# JPEG rather than PNG: encoding a full frame as PNG costs an order of
 				# magnitude more CPU, and Telegram recompresses photos either way.
-				quality = int(optional_setting('snapshot_jpeg_quality', 90))
+				quality = self.settings.get('snapshot_jpeg_quality')
 				snapshot_filename = str(snapshot_dir.joinpath(f'{datetimestr}.jpg'))
 				cv2.imwrite(snapshot_filename, frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
 				# Send the photo to telegram
-				send_photo_telegram(snapshot_filename, Settings.telegram_alarmlist, Settings.fractal_token, caption)
+				send_photo_telegram(snapshot_filename, self.settings.alarm_chat_ids(),
+									Settings.fractal_token, caption)
 			except:
 				mainlogger.warning(f'Problem in snapshot processor restarting in 10')
 				if item is not None:

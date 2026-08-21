@@ -1,6 +1,7 @@
 import os
 
-from utils import mainlogger, optional_setting
+from settings_store import get_store
+from utils import mainlogger
 from memory_managers import SharedFrameDeque
 from recorder import SegmentRecorder
 from decoder import FfmpegDecoder
@@ -26,7 +27,7 @@ class Stream(mp.Process):
 		self.decoder = FfmpegDecoder(
 			id, detect_url,
 			self.streaminfo['detect_dimensions'],
-			float(optional_setting('detect_fps', 5)))
+			get_store().get('detect_fps'))
 
 	def run(self):
 		mainlogger.info(f'Stream {self.streamid} starting with pid {os.getpid()}')

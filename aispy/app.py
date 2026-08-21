@@ -3,9 +3,9 @@ import time
 
 import numpy as np
 from streams import Stream
-from settings import UserSettings, Settings
-from utils import mainlogger, optional_setting
-from db_driver import DBDriver
+from settings import Settings
+from settings_store import get_store
+from utils import mainlogger
 from telegrambot import Telegrambot
 from watchdog import Watchdog
 import multiprocessing as mp
@@ -16,10 +16,13 @@ class FractalApp:
 
 	def __init__(self):
 		mainlogger.info(f'Fractal Initializing')
-		self.db = DBDriver(Settings.db_file)
+		# The parent owns the schema: prepare() creates or upgrades it and seeds it from
+		# settings.py the first time. Every other process just reads what is there.
+		self.settings = get_store(Settings.db_file)
+		self.settings.prepare()
 		self.streams = {}
 		# self.recordflags = {}
-		self.streaminfos = self.db.load_state()
+		self.streaminfos = self.settings.load_streams()
 		self.dbupdatequeue = None
 		self.process_outputs = {}
 		self.telegrambot = None
@@ -37,7 +40,7 @@ class FractalApp:
 		# Owned here, not by the bot: the auto arm/disarm schedule is replayed once per
 		# app start, so a Telegrambot process restart cannot undo a manual arm/disarm.
 		self.streaminfos[0]['timer_state_applied'] = mp.Value('i', 0)
-		for streamid in UserSettings.streaminfo.keys():
+		for streamid in list(self.streaminfos.keys()):
 			self.streaminfos[streamid]['armed'] = mp.Value('i', self.streaminfos[streamid]['armed'])
 			if streamid == 0:
 				continue
@@ -49,7 +52,7 @@ class FractalApp:
 			# pre_record_time * record_fps of them.
 			detect_dimensions = self.streaminfos[streamid]['detect_dimensions']
 			self.streaminfos[streamid]['framebuffer'] = SharedFrameDeque(
-				max_items=int(optional_setting('detect_buffer_frames', 8)),
+				max_items=self.settings.get('detect_buffer_frames'),
 				itemshape=(detect_dimensions[1], detect_dimensions[0], 3),
 				datatype=np.uint8
 			)
@@ -97,19 +100,15 @@ class FractalApp:
 	def dbupdater(self):
 		while True:
 			self.dbupdatequeue.get()
-			statedict = {}
-			for streamid in self.streaminfos.keys():
-				statedict[streamid] = {}
-				for k,v in self.streaminfos[streamid].items():
-					if k == 'armed':
-						statedict[streamid][k] = v.value
-					else:
-						statedict[streamid][k] = v
-			self.db.save_state(statedict)
+			# Only the armed flags are ours to write back: everything else in streaminfos
+			# is either configuration the admin panel owns or shared-memory scaffolding.
+			self.settings.save_armed_state(
+				{streamid: streaminfo['armed'].value
+				 for streamid, streaminfo in self.streaminfos.items()})
 
 	def run(self):
 		# Create the streams
-		for streamid in UserSettings.streaminfo.keys():
+		for streamid in list(self.streaminfos.keys()):
 			if streamid == 0:
 				continue
 			stream = Stream(streamid, self.streaminfos[streamid])

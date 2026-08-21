@@ -2,7 +2,8 @@ import subprocess
 import time
 from datetime import datetime, timedelta
 
-from settings import UserSettings, Settings
+from settings import Settings
+from settings_store import get_store
 from utils import mainlogger, optional_setting
 
 # Segment files are named for their wall-clock start. The pre-record and retention
@@ -31,19 +32,27 @@ class SegmentRecorder:
 	def __init__(self, streamid, streaminfo):
 		self.streamid = streamid
 		self.streaminfo = streaminfo
+		self.settings = get_store()
 		self.ffmpeg = optional_setting('ffmpeg_path', 'ffmpeg')
 		self.ffprobe = optional_setting('ffprobe_path', 'ffprobe')
-		# Requested segment length. '-c copy' can only cut on a keyframe, so a segment
-		# really lasts this long or one camera GOP, whichever is longer.
-		self.segment_time = int(optional_setting('segment_time', 2))
-		# Cache held beyond the pre-record window, so nothing is pruned in the gap
-		# between the detector raising recordflag and the collector noticing.
-		self.retention_margin = timedelta(
-			seconds=int(optional_setting('segment_retention_margin', 30)))
 		self.cachedir = optional_setting(
 			'cachedir', Settings.videodir.parent.joinpath('cache')).joinpath(str(streamid))
 		self.recorddir = Settings.videodir.joinpath(str(streamid))
 		self.codec = None
+
+	# Read per use rather than cached on self: an admin can retune these from the bot,
+	# and run_ffmpeg restarts the segmenter often enough to pick a new length up.
+	@property
+	def segment_time(self) -> int:
+		"""Requested segment length. '-c copy' can only cut on a keyframe, so a segment
+		really lasts this long or one camera GOP, whichever is longer."""
+		return self.settings.get('segment_time')
+
+	@property
+	def retention_margin(self) -> timedelta:
+		"""Cache held beyond the pre-record window, so nothing is pruned in the gap
+		between the detector raising recordflag and the collector noticing."""
+		return self.settings.get('segment_retention_margin')
 
 	# -- the ffmpeg segmenter ------------------------------------------------
 
@@ -119,7 +128,7 @@ class SegmentRecorder:
 
 	def prune(self, keep: set):
 		"""Drop segments that are past the retention window and not part of a clip."""
-		cutoff = datetime.now() - UserSettings.pre_record_time - self.retention_margin
+		cutoff = datetime.now() - self.settings.get('pre_record_time') - self.retention_margin
 		# The newest segment is the one ffmpeg is still writing, so it is never ours
 		# to delete.
 		for start, path in self.segments()[:-1]:
@@ -240,7 +249,7 @@ class SegmentRecorder:
 				if flag and not recording:
 					recording = True
 					clip_start = datetime.now()
-					clip_from = clip_start - UserSettings.pre_record_time
+					clip_from = clip_start - self.settings.get('pre_record_time')
 					draining_since = None
 					mainlogger.info(f'Recording on {self.streamid} started')
 				elif flag and draining_since is not None:
@@ -262,7 +271,7 @@ class SegmentRecorder:
 						self.flush(kept, clip_start)
 						clip_start = clip_from = draining_since = None
 						kept = []
-					elif datetime.now() - clip_start >= UserSettings.max_clip_length:
+					elif datetime.now() - clip_start >= self.settings.get('max_clip_length'):
 						self.flush(kept, clip_start)
 						# Everything flushed is free to prune. The segment ffmpeg is part way
 						# through opens the next clip, so nothing is dropped or duplicated

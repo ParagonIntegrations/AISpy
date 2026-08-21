@@ -5,7 +5,7 @@ import numpy as np
 import supervision as sv
 from supervision.draw.utils import draw_polygon
 import multiprocessing as mp
-from settings import UserSettings, Settings
+from settings_store import get_store
 from utils import mainlogger
 from detector import create_detector
 from detector.detector_api import DetectorAPI
@@ -18,7 +18,8 @@ class ObjectDetector(mp.Process):
 		super().__init__()
 		self.streaminfos = streaminfo
 		self.snapshotqueue = snapshotqueue
-		self.avginferencetime = Settings.avg_inference_time
+		self.settings = get_store()
+		self.avginferencetime = self.settings.get('avg_inference_time')
 		self.updatetime = updatetime
 		self.detectorload = detectorload
 		self.model: DetectorAPI | None = None
@@ -39,6 +40,10 @@ class ObjectDetector(mp.Process):
 				mainlogger.info(f'Starting detect process')
 				while True:
 					loopstarttime = datetime.now()
+					# Re-read every pass: both are live, so retuning them from the admin
+					# panel takes effect without restarting the detector.
+					detections_for_event = self.settings.get('detections_for_event')
+					check_detection_time = self.settings.get('check_detection_time')
 					# Get one frame from each camera for processing, This happens as per the settings
 					mainlogger.debug(f'Checking all streams for objects')
 					framebuff: list[tuple] = []
@@ -72,19 +77,19 @@ class ObjectDetector(mp.Process):
 						else:
 							recordcounter -= 1
 						recordcounter = max(0, recordcounter)
-						recordcounter = min(recordcounter, UserSettings.detections_for_event*2)
+						recordcounter = min(recordcounter, detections_for_event*2)
 						self.streaminfos[streamid]['recordcounter'] = recordcounter
 						if recordcounter:
 							mainlogger.debug(f'recordcounter {recordcounter}')
-						# Re-check items with a recordcounter of between 1 and UserSettings.detections_for_event to make sure if recording should happen
-						if 0 < recordcounter < UserSettings.detections_for_event and self.streaminfos[streamid]['recordflag'].value != 1:
+						# Re-check items with a recordcounter of between 1 and detections_for_event to make sure if recording should happen
+						if 0 < recordcounter < detections_for_event and self.streaminfos[streamid]['recordflag'].value != 1:
 							if motion_detections is None:
 								framebuff.append((streamid, self.streaminfos[streamid]['framebuffer'][-1], motion_detections))
 							else:
 								# Append from the motion detector
 								pass
 						# Set the recordflag if needed
-						if recordcounter >= UserSettings.detections_for_event and self.streaminfos[streamid]['recordflag'].value != 1:
+						if recordcounter >= detections_for_event and self.streaminfos[streamid]['recordflag'].value != 1:
 							self.streaminfos[streamid]['recordflag'].value = 1
 							mainlogger.info(f'Item found on Stream {streamid} setting recordflag')
 							self.streaminfos[0]['alarm'].value = 1
@@ -99,11 +104,11 @@ class ObjectDetector(mp.Process):
 					# Whatever is left of the interval is now simply idle. It used to
 					# be spent re-inferencing recorded clips to annotate them.
 					now = datetime.now()
-					time_left = loopstarttime + UserSettings.check_detection_time - now
+					time_left = loopstarttime + check_detection_time - now
 					time_left = time_left.total_seconds()
 					# Update the updatetime
 					self.updatetime.value = now.timestamp()
-					self.detectorload.value = (self.detectorload.value*19 + (1-time_left/UserSettings.check_detection_time.total_seconds()))/20
+					self.detectorload.value = (self.detectorload.value*19 + (1-time_left/check_detection_time.total_seconds()))/20
 
 					# Sleep if no more work is available
 					if time_left > 0:
