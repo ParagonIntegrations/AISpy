@@ -8,10 +8,14 @@ import numpy as np
 from utils import mainlogger, optional_setting
 
 # Tried in this order; the first that actually delivers a frame is kept for the life
-# of the process. Falling back one rung at a time means a board whose rkrga filter
-# chain is not what we expect still gets hardware decode, and a board with no MPP at
-# all still gets pictures.
-DECODE_VARIANTS = ('rkmpp_rga', 'rkmpp', 'software')
+# of the process.
+#
+# 'rkmpp' is last on purpose. Measured on an Orange Pi 5 across 30 seconds of 1080p
+# RTSP, CPU time came out at roughly 1.5s for rkmpp_rga, 7-10s for software and
+# 11-12s for rkmpp. VPU decode without the RGA filter has to drag every frame back
+# out of DMA memory and convert it in software, which costs more than never putting
+# it there - so it only makes sense as a last resort, not as a middle rung.
+DECODE_VARIANTS = ('rkmpp_rga', 'software', 'rkmpp')
 
 
 class FfmpegDecoder:
@@ -54,8 +58,9 @@ class FfmpegDecoder:
 						   f'scale_rkrga=w={self.width}:h={self.height}:format=bgr24:{exact},'
 						   f'hwdownload,format=bgr24')
 		elif variant == 'rkmpp':
-			# VPU decode, but let ffmpeg hand back software frames and scale them on
-			# the CPU. Slower than the RGA path, still far cheaper than decoding here.
+			# VPU decode, but ffmpeg hands back software frames and the scale and
+			# colour conversion happen on the CPU. Measured dearer than decoding in
+			# software outright; see DECODE_VARIANTS.
 			args += ['-hwaccel', 'rkmpp']
 			videofilter = f'fps={self.fps},scale=w={self.width}:h={self.height}:{exact}'
 		else:
