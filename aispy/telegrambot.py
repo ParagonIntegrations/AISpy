@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import time
 from functools import wraps
 import multiprocessing as mp
@@ -14,13 +15,16 @@ import cv2
 import requests
 
 from settings import Settings
-from settings_spec import CATEGORIES, CATEGORY_LABELS, SPECS_BY_NAME, specs_in
+from settings_spec import (CATEGORIES, CATEGORY_LABELS, COMMON_CLASSES, SPECS_BY_NAME,
+                           STREAM_FIELDS, STREAM_FIELDS_BY_NAME, class_names,
+                           format_classes, specs_in)
 from settings_store import (ROLE_ADMIN, ROLE_ALARM, ROLE_LABELS, ROLE_NOTIFY_ARM_DISARM,
                             ROLE_USER, get_store)
-from utils import mainlogger
+from utils import mainlogger, optional_setting
 import logging
-from autoarm import last_scheduled_action
+from autoarm import AutoArm, last_scheduled_action
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, MessageHandler, ConversationHandler,
                           ContextTypes, filters)
 
@@ -85,6 +89,15 @@ class Telegrambot(mp.Process):
         # Startup arm/disarm message, waiting for Telegram to come up (see post_init).
         self.startup_notification: asyncio.Task | None = None
 
+    def stream_label(self, streamid) -> str:
+        """What a camera is called on a button.
+
+        Read from the database rather than from the forked streaminfos dict, so renaming
+        a camera in the panel shows up here without waiting for a restart - unlike every
+        other stream field, a name is only ever used to label a button.
+        """
+        return self.settings.stream_name(streamid)
+
     def create_arm_disarm_keyboard(self):
         buttons_per_row = 2
         num_buttons = len(self.streaminfos.keys())
@@ -96,10 +109,7 @@ class Telegrambot(mp.Process):
                 text = 'Disarm'
             else:
                 text = 'Arm'
-            if streamid == 0:
-                text += ' All'
-            else:
-                text += f' Stream {streamid}'
+            text += f' {self.stream_label(streamid)}'
             streambutton = [InlineKeyboardButton(text, callback_data=f'arm_disarm_{streamid}')]
             row = (i+buttons_per_row-1)//buttons_per_row
             keyboard[row] += streambutton
@@ -115,11 +125,7 @@ class Telegrambot(mp.Process):
         keyboard = [[] for x in range(num_rows)]
         for i in range(num_buttons):
             streamid = list(self.streaminfos.keys())[i]
-            text = 'Snapshot for'
-            if streamid == 0:
-                text += ' All'
-            else:
-                text += f' Stream {streamid}'
+            text = f'Snapshot for {self.stream_label(streamid)}'
             streambutton = [InlineKeyboardButton(text, callback_data=f'take_snapshot_{streamid}')]
             row = (i+buttons_per_row-1)//buttons_per_row
             keyboard[row] += streambutton
@@ -128,16 +134,71 @@ class Telegrambot(mp.Process):
         keyboard[-1] += empties
         return keyboard
 
-    @restricted_to_admin
-    async def admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    # -- panel plumbing ------------------------------------------------------
+
+    @staticmethod
+    async def show(query, text, reply_markup=None) -> None:
+        """Replace the message a button was pressed on.
+
+        Telegram rejects an edit that changes nothing, which a menu full of Back buttons
+        makes easy to hit: leave a submenu and come straight back and the text is
+        identical. That is not a failure anyone needs to hear about.
+        """
+        try:
+            await query.edit_message_text(text=text, reply_markup=reply_markup)
+        except BadRequest as e:
+            if 'not modified' not in str(e).lower():
+                raise
+
+    @staticmethod
+    def joined(*parts) -> str:
+        return '\n\n'.join(part for part in parts if part)
+
+    @staticmethod
+    def shorten(text, limit=32) -> str:
+        """Keep a value readable on a button. URLs are the reason this exists."""
+        text = str(text)
+        return text if len(text) <= limit else f'{text[:limit - 1]}\u2026'
+
+    def restart_note(self) -> str:
+        """Said out loud wherever stream configuration is on screen.
+
+        A stream edit only reaches the running processes when they are forked again, so
+        an admin who changes a URL and walks away has changed nothing yet. The flag is
+        in the database and cleared by FractalApp on the way up, so it survives the bot
+        being restarted on its own and disappears exactly when the change takes effect.
+        """
+        return ('\u26a0 Stream changes are waiting for a restart.'
+                if self.settings.streams_dirty() else '')
+
+    def restart_rows(self) -> list:
+        if not self.settings.streams_dirty():
+            return []
+        return [[InlineKeyboardButton('\u26a0 Restart to apply stream changes',
+                                      callback_data='restart_docker')]]
+
+    def admin_keyboard(self) -> InlineKeyboardMarkup:
         keyboard = [
             [InlineKeyboardButton('User Management', callback_data=f'user_management_show')],
             [InlineKeyboardButton('Stream Management', callback_data=f'stream_management_show')],
             [InlineKeyboardButton('System Settings', callback_data=f'system_management_show')],
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.effective_message.reply_text("Choose an action:", reply_markup=reply_markup)
+        return InlineKeyboardMarkup(keyboard + self.restart_rows())
+
+    @restricted_to_admin
+    async def admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+        await update.effective_message.reply_text(
+            self.joined('Choose an action:', self.restart_note()),
+            reply_markup=self.admin_keyboard())
         return 'inline_keyboard'
+
+    @restricted_to_admin
+    async def admin_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """The same menu, for the Back buttons that have somewhere to go back to."""
+        query = update.callback_query
+        await query.answer()
+        await self.show(query, self.joined('Choose an action:', self.restart_note()),
+                        self.admin_keyboard())
 
     @restricted_to_admin
     async def admin_done(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -231,18 +292,309 @@ class Telegrambot(mp.Process):
         await query.edit_message_text(text=reply_str, reply_markup=InlineKeyboardMarkup(keyboard))
 
     # Stream Management Section
+    #
+    # Every field the editor offers comes from settings_spec.STREAM_FIELDS, so a new
+    # column is an entry in that table rather than a handler here. Two columns are
+    # deliberately not in it: `armed` belongs to the arm/disarm buttons, and the detect
+    # area is only ever written when a stream is created - there is no way to draw a
+    # polygon on a phone keyboard, and guessing would quietly destroy a hand-drawn one.
+
+    # How long ffprobe gets to answer before we give up and use a placeholder.
+    probe_timeout = 30
+
+    @staticmethod
+    def stream_title(row) -> str:
+        name = row['name']
+        return f'{name} (stream {row["streamid"]})' if name else f'Stream {row["streamid"]}'
+
+    def stream_menu_keyboard(self) -> InlineKeyboardMarkup:
+        keyboard = [[InlineKeyboardButton(self.stream_title(row),
+                                          callback_data=f'stream_show_{row["streamid"]}')]
+                    for row in self.settings.stream_rows()]
+        keyboard.append([InlineKeyboardButton('Add Stream', callback_data='stream_add')])
+        keyboard += self.restart_rows()
+        keyboard.append([InlineKeyboardButton('Back to Admin', callback_data='admin_menu_show')])
+        return InlineKeyboardMarkup(keyboard)
+
+    def stream_menu(self, prefix='') -> tuple:
+        streams = self.settings.stream_rows()
+        heading = 'Choose a stream' if streams else 'No streams configured yet'
+        return (self.joined(prefix, heading, self.restart_note()),
+                self.stream_menu_keyboard())
+
     @restricted_to_admin
     async def stream_management_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         await query.answer()
+        await self.show(query, *self.stream_menu())
+
+    def field_display(self, field, value) -> str:
+        """A field's value as the panel shows it, names rather than class numbers."""
+        if field.name == 'detection_classes':
+            return format_classes(value)
+        return field.format(value)
+
+    def stream_editor_keyboard(self, row) -> InlineKeyboardMarkup:
+        streamid = row['streamid']
+        keyboard = []
+        for field in STREAM_FIELDS:
+            if field.kind == 'bool':
+                callback = f'stream_toggle_{streamid}_{field.name}'
+            elif field.name == 'detection_classes':
+                callback = f'stream_classes_{streamid}'
+            else:
+                callback = f'stream_edit_{streamid}_{field.name}'
+            keyboard.append([InlineKeyboardButton(
+                f'{field.label}: {self.shorten(self.field_display(field, row[field.name]))}',
+                callback_data=callback)])
+        keyboard.append([InlineKeyboardButton('Delete Stream',
+                                              callback_data=f'stream_remove_{streamid}')])
+        keyboard += self.restart_rows()
+        keyboard.append([InlineKeyboardButton('Back to Streams',
+                                              callback_data='stream_management_show')])
+        return InlineKeyboardMarkup(keyboard)
+
+    def stream_editor(self, streamid, prefix='') -> tuple:
+        """(text, keyboard) for one stream, falling back to the list if it is gone."""
+        row = self.settings.stream_row(streamid)
+        if row is None:
+            return self.stream_menu(self.joined(prefix, 'That stream no longer exists'))
+        return (self.joined(prefix, self.stream_title(row), self.restart_note()),
+                self.stream_editor_keyboard(row))
+
+    @restricted_to_admin
+    async def stream_show(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        streamid = int(re.match(r'^stream_show_(\d+)$', query.data).group(1))
+        await self.show(query, *self.stream_editor(streamid))
+
+    # -- adding --------------------------------------------------------------
+
+    async def probe_dimensions(self, url) -> tuple:
+        """Ask ffprobe how big the picture is. Returns (dimensions, complaint).
+
+        A camera that is merely unplugged this minute is still worth configuring, so a
+        probe that fails is a warning and a placeholder rather than a refusal. Run in a
+        thread: the admin's message is being handled on the Application's event loop, and
+        an unreachable camera takes the full timeout to say so.
+        """
+        ffprobe = optional_setting('ffprobe_path', 'ffprobe')
+        command = [ffprobe, '-v', 'error']
+        if str(url).lower().startswith('rtsp://'):
+            # Matching the recorder: UDP loses packets on anything but a quiet LAN.
+            command += ['-rtsp_transport', 'tcp']
+        command += ['-select_streams', 'v:0', '-show_entries', 'stream=width,height',
+                    '-of', 'csv=s=x:p=0', str(url)]
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run, command, capture_output=True, timeout=self.probe_timeout)
+            first_line = result.stdout.decode(errors='replace').strip().splitlines()[0]
+            width, height = (int(part) for part in first_line.split('x')[:2])
+            return (width, height), ''
+        except Exception:
+            mainlogger.warning(f'Could not probe the dimensions of {url}')
+            width, height = STREAM_FIELDS_BY_NAME['dimensions'].default
+            return None, (f'Could not read the picture size from that URL, so Dimensions '
+                          f'are set to {width}x{height}. Check them before restarting.')
+
+    @restricted_to_admin
+    async def stream_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+        query = update.callback_query
+        await query.answer()
+        context.user_data['stream_id'] = None
+        context.user_data['stream_field'] = 'url'
+        await self.show(query, self.joined(
+            'Paste the URL of the stream to record from.',
+            'ffprobe is asked for its dimensions; everything else starts at its default '
+            'and can be changed on the next screen.'))
+        return 'stream_text_input'
+
+    async def create_stream(self, update: Update, context: ContextTypes.DEFAULT_TYPE, url) -> str:
+        await update.effective_message.reply_text('Probing the stream, one moment')
+        dimensions, complaint = await self.probe_dimensions(url)
+        try:
+            streamid = self.settings.add_stream(url, dimensions=dimensions)
+        except Exception as e:
+            await update.effective_message.reply_text(f'{e}\n\nPaste a URL to try again')
+            return 'stream_text_input'
+        mainlogger.info(f'{update.effective_user.id} added stream {streamid} on {url}')
+        context.user_data['stream_id'] = streamid
+        context.user_data['stream_field'] = None
+        text, reply_markup = self.stream_editor(
+            streamid, self.joined(f'Stream {streamid} created.', complaint))
+        await update.effective_message.reply_text(text, reply_markup=reply_markup)
+        return 'inline_keyboard'
+
+    # -- editing -------------------------------------------------------------
+
+    def stream_field_prompt(self, field, row=None) -> str:
+        lines = [field.label, field.description]
+        if row is not None:
+            lines.append(f'Current: {self.field_display(field, row[field.name])}')
+        if field.name == 'detection_classes':
+            lines.append('Type class names or numbers, separated by commas. '
+                         'Send - for everything the model knows.')
+        elif field.optional:
+            lines.append(f'Send - to clear it back to {field.unset_label}.')
+        else:
+            lines.append('Type a new value')
+        return self.joined(*lines)
+
+    @restricted_to_admin
+    async def stream_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+        query = update.callback_query
+        await query.answer()
+        streamid, name = re.match(r'^stream_edit_(\d+)_(\w+)$', query.data).groups()
+        streamid = int(streamid)
+        row = self.settings.stream_row(streamid)
+        if row is None:
+            await self.show(query, *self.stream_menu('That stream no longer exists'))
+            return 'inline_keyboard'
+        context.user_data['stream_id'] = streamid
+        context.user_data['stream_field'] = name
+        await self.show(query, self.stream_field_prompt(STREAM_FIELDS_BY_NAME[name], row))
+        return 'stream_text_input'
+
+    @restricted_to_admin
+    async def stream_edit_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+        name = context.user_data.get('stream_field')
+        if name is None:
+            await update.effective_message.reply_text('Start again from /admin')
+            return ConversationHandler.END
+        field = STREAM_FIELDS_BY_NAME[name]
+        # An empty Telegram message is not a thing, so a lone dash is how an admin says
+        # 'nothing' - unset for an optional field, every class for the class list.
+        text = update.message.text
+        text = '' if text.strip() == '-' else text
+        streamid = context.user_data.get('stream_id')
+        try:
+            value = field.parse(text)
+            if streamid is not None:
+                self.settings.set_stream_field(streamid, name, value)
+        except Exception as e:
+            row = None if streamid is None else self.settings.stream_row(streamid)
+            await update.effective_message.reply_text(
+                self.joined(str(e), self.stream_field_prompt(field, row)))
+            return 'stream_text_input'
+        if streamid is None:
+            return await self.create_stream(update, context, value)
+        mainlogger.info(f'{update.effective_user.id} set stream {streamid} {name} to '
+                        f'{self.field_display(field, value)}')
+        context.user_data['stream_field'] = None
+        text, reply_markup = self.stream_editor(
+            streamid, f'{field.label} is now {self.field_display(field, value)}')
+        await update.effective_message.reply_text(text, reply_markup=reply_markup)
+        return 'inline_keyboard'
+
+    @restricted_to_admin
+    async def stream_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        streamid, name = re.match(r'^stream_toggle_(\d+)_(\w+)$', query.data).groups()
+        streamid = int(streamid)
+        field = STREAM_FIELDS_BY_NAME[name]
+        row = self.settings.stream_row(streamid)
+        if row is None:
+            await self.show(query, *self.stream_editor(streamid))
+            return
+        value = self.settings.set_stream_field(streamid, name, not row[name])
+        mainlogger.info(f'{update.effective_user.id} set stream {streamid} {name} to '
+                        f'{field.format(value)}')
+        await self.show(query, *self.stream_editor(
+            streamid, f'{field.label} is now {field.format(value)}'))
+
+    # -- detection classes ---------------------------------------------------
+
+    def stream_classes_keyboard(self, streamid, selected) -> InlineKeyboardMarkup:
+        """Toggles for what a security camera is usually pointed at.
+
+        The rest of coco.yaml is still reachable, by typing it: eighty paged buttons to
+        find 'zebra' is not worth the screens it would take.
+        """
+        names = class_names()
+        keyboard = []
+        for index in range(0, len(COMMON_CLASSES), 2):
+            keyboard.append([
+                InlineKeyboardButton(
+                    f'{"✓ " if class_id in selected else ""}'
+                    f'{names.get(class_id, class_id)}',
+                    callback_data=f'stream_class_{streamid}_{class_id}')
+                for class_id in COMMON_CLASSES[index:index + 2]])
+        keyboard.append([InlineKeyboardButton(
+            'Type other classes',
+            callback_data=f'stream_edit_{streamid}_detection_classes')])
+        keyboard.append([InlineKeyboardButton('Done', callback_data=f'stream_show_{streamid}')])
+        return InlineKeyboardMarkup(keyboard)
+
+    def stream_classes(self, streamid, prefix='') -> tuple:
+        row = self.settings.stream_row(streamid)
+        if row is None:
+            return self.stream_menu(self.joined(prefix, 'That stream no longer exists'))
+        selected = row['detection_classes']
+        return (self.joined(prefix, self.stream_title(row),
+                            f'Detecting: {format_classes(selected)}'),
+                self.stream_classes_keyboard(streamid, selected))
+
+    @restricted_to_admin
+    async def stream_classes_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        streamid = int(re.match(r'^stream_classes_(\d+)$', query.data).group(1))
+        await self.show(query, *self.stream_classes(streamid))
+
+    @restricted_to_admin
+    async def stream_class_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        streamid, class_id = re.match(r'^stream_class_(\d+)_(\d+)$', query.data).groups()
+        streamid, class_id = int(streamid), int(class_id)
+        row = self.settings.stream_row(streamid)
+        if row is None:
+            await self.show(query, *self.stream_classes(streamid))
+            return
+        selected = list(row['detection_classes'])
+        if class_id in selected:
+            selected.remove(class_id)
+        else:
+            selected.append(class_id)
+        self.settings.set_stream_field(streamid, 'detection_classes', sorted(selected))
+        mainlogger.info(f'{update.effective_user.id} set stream {streamid} classes to '
+                        f'{format_classes(selected)}')
+        await self.show(query, *self.stream_classes(streamid))
+
+    # -- deleting ------------------------------------------------------------
+
+    @restricted_to_admin
+    async def stream_remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        streamid = int(re.match(r'^stream_remove_(\d+)$', query.data).group(1))
+        row = self.settings.stream_row(streamid)
+        if row is None:
+            await self.show(query, *self.stream_menu('That stream no longer exists'))
+            return
         keyboard = [
-                [InlineKeyboardButton('Add Stream', callback_data=f'stream_management_add_stream_show'),],
-                [InlineKeyboardButton('Remove Stream', callback_data=f'stream_management_remove_stream_show'),],
-                [InlineKeyboardButton('Edit Stream', callback_data=f'stream_management_edit_stream_show'),],
+            [InlineKeyboardButton('Yes, delete it', callback_data=f'stream_delete_{streamid}')],
+            [InlineKeyboardButton('Cancel', callback_data=f'stream_show_{streamid}')],
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        reply_str = 'Choose an option'
-        await query.edit_message_text(text=reply_str, reply_markup=reply_markup)
+        await self.show(query, self.joined(
+            f'Delete {self.stream_title(row)}?', f'URL: {row["url"]}',
+            'Clips and segments already on disk are kept.'), InlineKeyboardMarkup(keyboard))
+
+    @restricted_to_admin
+    async def stream_delete(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        streamid = int(re.match(r'^stream_delete_(\d+)$', query.data).group(1))
+        row = self.settings.stream_row(streamid)
+        if row is None:
+            await self.show(query, *self.stream_menu('That stream no longer exists'))
+            return
+        title = self.stream_title(row)
+        self.settings.remove_stream(streamid)
+        mainlogger.info(f'{update.effective_user.id} deleted stream {streamid}')
+        await self.show(query, *self.stream_menu(f'Deleted {title}'))
 
     # System Management Section
     @restricted_to_admin
@@ -353,12 +705,19 @@ class Telegrambot(mp.Process):
         await query.edit_message_text(text=reply_str)
         os.kill(1, 9)
 
+    # Timer Management Section
+    #
+    # Unlike streams, these are live: auto_arm_disarm_timer re-reads the schedule every
+    # pass, so an added or edited timer takes effect without a restart.
+
+    DAY_LETTERS = 'MTWTFSS'
+
     def create_timer_keyboard(self) -> list:
-        """The master switch, then one toggle per configured timer.
+        """The master switch, then one row per timer, then the two Add buttons.
 
         The per-timer buttons used to be unreachable: timers came from a Python list in
-        settings.py with nothing to address them by. They have row ids now, so
-        enable/disable can act on a single one.
+        settings.py with nothing to address them by. They have row ids now, so the label
+        opens that one timer and the state next to it flips it without leaving the list.
         """
         if self.settings.get('timers_enabled'):
             keyboard = [[InlineKeyboardButton('Disable All Timers',
@@ -369,28 +728,44 @@ class Telegrambot(mp.Process):
         for row in self.settings.timer_rows():
             action = 'disable' if row['enabled'] else 'enable'
             state = 'on' if row['enabled'] else 'off'
-            keyboard.append([InlineKeyboardButton(
-                f'{self.timer_str(row)} [{state}]',
-                callback_data=f'timer_management_{action}_{row["id"]}')])
+            keyboard.append([
+                InlineKeyboardButton(self.timer_str(row),
+                                     callback_data=f'timer_show_{row["id"]}'),
+                InlineKeyboardButton(f'[{state}]',
+                                     callback_data=f'timer_management_{action}_{row["id"]}'),
+            ])
+        keyboard.append([
+            InlineKeyboardButton('Add Arm timer', callback_data='timer_add_arm'),
+            InlineKeyboardButton('Add Disarm timer', callback_data='timer_add_disarm'),
+        ])
+        keyboard.append([InlineKeyboardButton('Back to System Settings',
+                                              callback_data='system_management_show')])
         return keyboard
 
     @staticmethod
     def timer_str(row) -> str:
         arm_str = 'Arm' if row['do_arm'] else 'Disarm'
-        days = ''.join('MTWTFSS'[day] for day in sorted(json.loads(row['active_days'])))
+        days = ''.join(Telegrambot.DAY_LETTERS[day]
+                       for day in sorted(json.loads(row['active_days'])))
         every = '' if row['repeat_every_days'] == 1 else f'/{row["repeat_every_days"]}d'
         return f'{arm_str} {row["hour"]:02d}:{row["minute"]:02d} {days}{every}'
+
+    def timer_menu(self, prefix='') -> tuple:
+        heading = ('Choose a timer, or add one' if self.settings.timer_rows()
+                   else 'No timers configured yet')
+        if not self.settings.get('timers_enabled'):
+            heading = self.joined(heading, 'The master switch is off, so none of them fire.')
+        return self.joined(prefix, heading), InlineKeyboardMarkup(self.create_timer_keyboard())
 
     @restricted_to_admin
     async def timer_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         await query.answer()
-        reply_markup = InlineKeyboardMarkup(self.create_timer_keyboard())
-        await query.edit_message_text(text='Choose an option', reply_markup=reply_markup)
+        await self.show(query, *self.timer_menu())
 
     @restricted_to_admin
     async def set_timer_enabled(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Toggle the master switch (id 0) or a single timer.
+        """Toggle the master switch (id 0) or a single timer, from the list.
 
         Both live in the database now: the master switch used to be an attribute on this
         process, so 'Disable All Timers' quietly un-disabled itself whenever the
@@ -413,8 +788,234 @@ class Telegrambot(mp.Process):
                 self.settings.set_timer_enabled(timer_id, enabled)
                 reply_str = f'{action.capitalize()}d {self.timer_str(row)}'
         mainlogger.info(f'{update.effective_user.id}: {reply_str}')
-        reply_markup = InlineKeyboardMarkup(self.create_timer_keyboard())
-        await query.edit_message_text(text=reply_str, reply_markup=reply_markup)
+        await self.show(query, *self.timer_menu(reply_str))
+
+    # -- one timer -----------------------------------------------------------
+
+    def timer_next_str(self, row) -> str:
+        """When this timer fires next, or why it never will.
+
+        Worth the arithmetic: a weekday list and an every-N-days repeat that never line
+        up produce a timer that looks perfectly reasonable in the list and does nothing
+        for the rest of its life.
+        """
+        timer = AutoArm(hour=row['hour'], minute=row['minute'],
+                        repeat_every_days=row['repeat_every_days'],
+                        active_days=json.loads(row['active_days']),
+                        do_arm=bool(row['do_arm']))
+        if timer.next_time is None:
+            return ('⚠ This timer can never fire: no day matches both its weekdays '
+                    'and its repeat.')
+        if not row['enabled']:
+            return f'Disabled. Would next fire {timer.next_time.strftime("%a %d %b at %H:%M")}'
+        if not self.settings.get('timers_enabled'):
+            return (f'The master switch is off. Would next fire '
+                    f'{timer.next_time.strftime("%a %d %b at %H:%M")}')
+        return f'Next: {timer.next_time.strftime("%a %d %b at %H:%M")}'
+
+    def timer_editor_keyboard(self, row) -> InlineKeyboardMarkup:
+        timer_id = row['id']
+        active_days = json.loads(row['active_days'])
+        keyboard = [
+            [InlineKeyboardButton(f'Time: {row["hour"]:02d}:{row["minute"]:02d}',
+                                  callback_data=f'timer_edit_{timer_id}_time')],
+            [InlineKeyboardButton(f'Action: {"Arm" if row["do_arm"] else "Disarm"}',
+                                  callback_data=f'timer_action_{timer_id}')],
+            [InlineKeyboardButton(f'Repeat: every {row["repeat_every_days"]}d',
+                                  callback_data=f'timer_edit_{timer_id}_repeat')],
+            [InlineKeyboardButton(f'{"✓" if day in active_days else ""}{self.DAY_LETTERS[day]}',
+                                  callback_data=f'timer_day_{timer_id}_{day}')
+             for day in range(7)],
+            [InlineKeyboardButton('Disable' if row['enabled'] else 'Enable',
+                                  callback_data=f'timer_toggle_{timer_id}'),
+             InlineKeyboardButton('Delete', callback_data=f'timer_remove_{timer_id}')],
+            [InlineKeyboardButton('Back to Timers', callback_data='timer_management_show')],
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    def timer_editor(self, timer_id, prefix='') -> tuple:
+        """(text, keyboard) for one timer, falling back to the list if it is gone."""
+        row = self.settings.timer_row(timer_id)
+        if row is None:
+            return self.timer_menu(self.joined(prefix, 'That timer no longer exists'))
+        return (self.joined(prefix, self.timer_str(row), self.timer_next_str(row)),
+                self.timer_editor_keyboard(row))
+
+    @restricted_to_admin
+    async def timer_show(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        timer_id = int(re.match(r'^timer_show_(\d+)$', query.data).group(1))
+        await self.show(query, *self.timer_editor(timer_id))
+
+    @restricted_to_admin
+    async def timer_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Enable or disable from inside the timer's own screen, and stay there."""
+        query = update.callback_query
+        await query.answer()
+        timer_id = int(re.match(r'^timer_toggle_(\d+)$', query.data).group(1))
+        row = self.settings.timer_row(timer_id)
+        if row is None:
+            await self.show(query, *self.timer_editor(timer_id))
+            return
+        enabled = not row['enabled']
+        self.settings.set_timer_enabled(timer_id, enabled)
+        mainlogger.info(f'{update.effective_user.id} '
+                        f'{"enabled" if enabled else "disabled"} {self.timer_str(row)}')
+        await self.show(query, *self.timer_editor(
+            timer_id, 'Enabled' if enabled else 'Disabled'))
+
+    @restricted_to_admin
+    async def timer_action_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        timer_id = int(re.match(r'^timer_action_(\d+)$', query.data).group(1))
+        row = self.settings.timer_row(timer_id)
+        if row is None:
+            await self.show(query, *self.timer_editor(timer_id))
+            return
+        do_arm = not row['do_arm']
+        self.settings.update_timer(timer_id, do_arm=do_arm)
+        mainlogger.info(f'{update.effective_user.id} made timer {timer_id} '
+                        f'{"arm" if do_arm else "disarm"}')
+        await self.show(query, *self.timer_editor(
+            timer_id, f'Now {"an arm" if do_arm else "a disarm"} timer'))
+
+    @restricted_to_admin
+    async def timer_day_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        timer_id, day = re.match(r'^timer_day_(\d+)_(\d+)$', query.data).groups()
+        timer_id, day = int(timer_id), int(day)
+        row = self.settings.timer_row(timer_id)
+        if row is None:
+            await self.show(query, *self.timer_editor(timer_id))
+            return
+        active_days = json.loads(row['active_days'])
+        if day in active_days:
+            active_days.remove(day)
+        else:
+            active_days.append(day)
+        try:
+            self.settings.update_timer(timer_id, active_days=active_days)
+        except ValueError as e:
+            # Emptying the list would be a timer that fires on no day at all.
+            await self.show(query, *self.timer_editor(timer_id, str(e)))
+            return
+        await self.show(query, *self.timer_editor(timer_id))
+
+    # -- adding --------------------------------------------------------------
+
+    @restricted_to_admin
+    async def timer_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+        """Ask for the time; the timer itself is created once we have one.
+
+        It starts on every day of the week, which is both the common case and the only
+        answer that cannot be wrong in a way that silently does nothing.
+        """
+        query = update.callback_query
+        await query.answer()
+        do_arm = re.match(r'^timer_add_(arm|disarm)$', query.data).group(1) == 'arm'
+        context.user_data['timer_id'] = None
+        context.user_data['timer_field'] = 'time'
+        context.user_data['timer_do_arm'] = do_arm
+        await self.show(query, self.joined(
+            f'New {"arm" if do_arm else "disarm"} timer.',
+            'Type the time as HH:MM'))
+        return 'timer_text_input'
+
+    def parse_hhmm(self, text) -> tuple:
+        match = re.match(r'^(\d{1,2})\s*[:.h]?\s*(\d{2})?$', text.strip())
+        if match is None:
+            raise ValueError('Type the time as HH:MM, like 22:30')
+        return self.settings.check_time(match.group(1), match.group(2) or 0)
+
+    @staticmethod
+    def timer_field_prompt(field) -> str:
+        if field == 'time':
+            return 'Type the time as HH:MM'
+        return ('Type how many days apart this timer repeats. 1 is every day it is '
+                'allowed to fire, 7 makes it the same weekday every week.')
+
+    @restricted_to_admin
+    async def timer_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+        query = update.callback_query
+        await query.answer()
+        timer_id, field = re.match(r'^timer_edit_(\d+)_(time|repeat)$', query.data).groups()
+        timer_id = int(timer_id)
+        if self.settings.timer_row(timer_id) is None:
+            await self.show(query, *self.timer_menu('That timer no longer exists'))
+            return 'inline_keyboard'
+        context.user_data['timer_id'] = timer_id
+        context.user_data['timer_field'] = field
+        await self.show(query, self.timer_field_prompt(field))
+        return 'timer_text_input'
+
+    @restricted_to_admin
+    async def timer_edit_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+        field = context.user_data.get('timer_field')
+        if field is None:
+            await update.effective_message.reply_text('Start again from /admin')
+            return ConversationHandler.END
+        timer_id = context.user_data.get('timer_id')
+        prefix = ''
+        try:
+            if field == 'time':
+                hour, minute = self.parse_hhmm(update.message.text)
+                if timer_id is None:
+                    timer_id = self.settings.add_timer(
+                        hour=hour, minute=minute,
+                        do_arm=context.user_data.get('timer_do_arm', True))
+                    context.user_data['timer_id'] = timer_id
+                    prefix = 'Created, on every day of the week. Turn off the days it should skip.'
+                else:
+                    self.settings.update_timer(timer_id, hour=hour, minute=minute)
+                    prefix = f'Time is now {hour:02d}:{minute:02d}'
+            else:
+                repeat = int(update.message.text.strip())
+                self.settings.update_timer(timer_id, repeat_every_days=repeat)
+                prefix = f'Repeating every {max(1, repeat)}d'
+        except Exception as e:
+            await update.effective_message.reply_text(
+                self.joined(str(e), self.timer_field_prompt(field)))
+            return 'timer_text_input'
+        mainlogger.info(f'{update.effective_user.id}: timer {timer_id} - {prefix}')
+        context.user_data['timer_field'] = None
+        text, reply_markup = self.timer_editor(timer_id, prefix)
+        await update.effective_message.reply_text(text, reply_markup=reply_markup)
+        return 'inline_keyboard'
+
+    # -- deleting ------------------------------------------------------------
+
+    @restricted_to_admin
+    async def timer_remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        timer_id = int(re.match(r'^timer_remove_(\d+)$', query.data).group(1))
+        row = self.settings.timer_row(timer_id)
+        if row is None:
+            await self.show(query, *self.timer_menu('That timer no longer exists'))
+            return
+        keyboard = [
+            [InlineKeyboardButton('Yes, delete it', callback_data=f'timer_delete_{timer_id}')],
+            [InlineKeyboardButton('Cancel', callback_data=f'timer_show_{timer_id}')],
+        ]
+        await self.show(query, f'Delete {self.timer_str(row)}?',
+                        InlineKeyboardMarkup(keyboard))
+
+    @restricted_to_admin
+    async def timer_delete(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        await query.answer()
+        timer_id = int(re.match(r'^timer_delete_(\d+)$', query.data).group(1))
+        row = self.settings.timer_row(timer_id)
+        if row is None:
+            await self.show(query, *self.timer_menu('That timer no longer exists'))
+            return
+        description = self.timer_str(row)
+        self.settings.remove_timer(timer_id)
+        mainlogger.info(f'{update.effective_user.id} deleted {description}')
+        await self.show(query, *self.timer_menu(f'Deleted {description}'))
 
     # General Section
     @restricted_to_user
@@ -453,10 +1054,7 @@ class Telegrambot(mp.Process):
                 reply_str = 'Armed'
                 self.streaminfos[streamid]['armed'].value = 1
                 self.dbupdatequeue.put('Update')
-            if streamid == 0:
-                reply_str += f' All'
-            else:
-                reply_str += f' Stream {streamid}'
+            reply_str += f' {self.stream_label(streamid)}'
             reply_str += f' at {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
             mainlogger.info(reply_str)
         reply_markup = InlineKeyboardMarkup(self.create_arm_disarm_keyboard())
@@ -482,7 +1080,7 @@ class Telegrambot(mp.Process):
                 # encode
                 is_success, buffer = cv2.imencode(".jpg", img)
                 io_buf = io.BytesIO(buffer)
-                await update.effective_message.reply_photo(io_buf, f'Stream {stream}')
+                await update.effective_message.reply_photo(io_buf, self.stream_label(stream))
             await self.start_command(update, context)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -738,17 +1336,34 @@ class Telegrambot(mp.Process):
             ],
             states={
                 'inline_keyboard': [
+                    CallbackQueryHandler(self.admin_menu, pattern='^admin_menu_show$'),
                     CallbackQueryHandler(self.user_management_entry, pattern='^user_management_show$'),
                     CallbackQueryHandler(self.user_management_add,
                                          pattern=f'^user_management_add_({ROLE_PATTERN})$'),
                     CallbackQueryHandler(self.user_management_remove,
                                          pattern=f'^user_management_(remove|del)_({ROLE_PATTERN})(_-?\\d+)?$'),
                     CallbackQueryHandler(self.stream_management_entry, pattern='^stream_management_show$'),
+                    CallbackQueryHandler(self.stream_add, pattern='^stream_add$'),
+                    CallbackQueryHandler(self.stream_show, pattern=r'^stream_show_\d+$'),
+                    CallbackQueryHandler(self.stream_edit, pattern=r'^stream_edit_\d+_\w+$'),
+                    CallbackQueryHandler(self.stream_toggle, pattern=r'^stream_toggle_\d+_\w+$'),
+                    CallbackQueryHandler(self.stream_classes_entry, pattern=r'^stream_classes_\d+$'),
+                    CallbackQueryHandler(self.stream_class_toggle, pattern=r'^stream_class_\d+_\d+$'),
+                    CallbackQueryHandler(self.stream_remove, pattern=r'^stream_remove_\d+$'),
+                    CallbackQueryHandler(self.stream_delete, pattern=r'^stream_delete_\d+$'),
                     CallbackQueryHandler(self.system_management_entry, pattern='^system_management_show$'),
                     CallbackQueryHandler(self.restart_docker, pattern='^restart_docker$'),
                     CallbackQueryHandler(self.timer_entry, pattern='^timer_management_show$'),
                     CallbackQueryHandler(self.set_timer_enabled,
                                          pattern=r'^timer_management_(enable|disable)_\d+$'),
+                    CallbackQueryHandler(self.timer_add, pattern='^timer_add_(arm|disarm)$'),
+                    CallbackQueryHandler(self.timer_show, pattern=r'^timer_show_\d+$'),
+                    CallbackQueryHandler(self.timer_edit, pattern=r'^timer_edit_\d+_(time|repeat)$'),
+                    CallbackQueryHandler(self.timer_toggle, pattern=r'^timer_toggle_\d+$'),
+                    CallbackQueryHandler(self.timer_action_toggle, pattern=r'^timer_action_\d+$'),
+                    CallbackQueryHandler(self.timer_day_toggle, pattern=r'^timer_day_\d+_\d+$'),
+                    CallbackQueryHandler(self.timer_remove, pattern=r'^timer_remove_\d+$'),
+                    CallbackQueryHandler(self.timer_delete, pattern=r'^timer_delete_\d+$'),
                     CallbackQueryHandler(self.settings_entry, pattern='^settings_show$'),
                     CallbackQueryHandler(self.settings_category, pattern='^settings_category_.*$'),
                     CallbackQueryHandler(self.settings_toggle, pattern='^settings_toggle_.*$'),
@@ -761,6 +1376,17 @@ class Telegrambot(mp.Process):
                 'setting_text_input': [
                     MessageHandler(filters.TEXT & ~(filters.COMMAND | filters.Regex("^exit admin$")),
                                    self.settings_edit_input),
+                ],
+                # The stream and timer editors both start a text prompt from a button and
+                # come back to an inline keyboard, so each needs a state of its own to
+                # know which of the two typed answers it is reading.
+                'stream_text_input': [
+                    MessageHandler(filters.TEXT & ~(filters.COMMAND | filters.Regex("^exit admin$")),
+                                   self.stream_edit_input),
+                ],
+                'timer_text_input': [
+                    MessageHandler(filters.TEXT & ~(filters.COMMAND | filters.Regex("^exit admin$")),
+                                   self.timer_edit_input),
                 ],
             },
             fallbacks=[

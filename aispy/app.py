@@ -23,6 +23,10 @@ class FractalApp:
 		self.streams = {}
 		# self.recordflags = {}
 		self.streaminfos = self.settings.load_streams()
+		# Everything below is built from these rows and then forked, so this is the one
+		# moment the database and what is actually running are known to agree. The panel
+		# sets the flag again on the next edit and shows it until we get back here.
+		self.settings.clear_streams_dirty()
 		self.dbupdatequeue = None
 		self.process_outputs = {}
 		self.telegrambot = None

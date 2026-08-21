@@ -3,7 +3,14 @@
 Only bootstrap, secrets and host layout live here now. Everything an admin is expected
 to change - the Telegram user lists, the streams, the auto arm/disarm schedule and the
 detection and recording tunables - lives in the database and is edited from the bot's
-/admin panel. See settings_spec.py for the catalogue.
+/admin panel. See settings_spec.py for the catalogue: SPECS for the tunables and
+STREAM_FIELDS for the per-stream ones.
+
+Streams and timers can be added, edited and deleted from the panel, so a new device can
+be set up entirely from Telegram and the UserSettings block below is only needed if you
+would rather seed one from a file. Stream edits are the one thing that is not live: the
+stream processes read their configuration once, when they are forked, so the panel says
+a restart is pending and offers the button until the app has come back up.
 
 Upgrading an existing install: leave your current settings.py exactly as it is. The
 first run creates the new tables and copies the moved settings across, after which the
@@ -89,10 +96,17 @@ class UserSettings:
 				'detectarea': [[0, 0], [1920, 0], [1920, 1080], [0, 1080]],
 				'detection_classes': [0],
 				'confidence_threshold': 0.5,
-				'detect': 1,
-				'record': 1,
 				'lite_aspect_ratio': False,
 			},
+
+	'detectarea' is the only stream field the panel will not edit: there is no way to
+	draw a polygon on a phone keyboard, and a stream added from Telegram gets the whole
+	frame. Write one here, or into the database, and the panel leaves it alone - it is
+	rescaled if you change 'dimensions' and never otherwise touched.
+
+	'detect' and 'record' are accepted for an existing install but nothing reads them.
+	Whether a stream is watched is the per-stream arm/disarm button, and the recorder
+	always records.
 		}
 
 		auto_arm_disarm_list = [AutoArm(hour=22, do_arm=True),

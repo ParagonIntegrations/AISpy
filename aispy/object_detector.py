@@ -93,13 +93,15 @@ class ObjectDetector(mp.Process):
 							self.streaminfos[streamid]['recordflag'].value = 1
 							mainlogger.info(f'Item found on Stream {streamid} setting recordflag')
 							self.streaminfos[0]['alarm'].value = 1
-							self.snapshotqueue.put((streamid, annotated_frame, f'Alarm Active on stream {streamid}'))
+							self.snapshotqueue.put((streamid, annotated_frame,
+													f'Alarm Active on {self.settings.stream_name(streamid)}'))
 						# Clear the recordflag when the counter is decreasing and at 1 while recording
 						if recordcounter == 1 and num_detections == 0 and self.streaminfos[streamid]['recordflag'].value == 1:
 							self.streaminfos[streamid]['recordflag'].value = 0
 							mainlogger.info(f'No more items on Stream {streamid}, clearing recordflag')
 							if self.streaminfos[0]['armed'].value and self.streaminfos[streamid]['armed'].value:
-								self.snapshotqueue.put((streamid, annotated_frame, f'Alarm Cleared on stream {streamid}'))
+								self.snapshotqueue.put((streamid, annotated_frame,
+														f'Alarm Cleared on {self.settings.stream_name(streamid)}'))
 
 					# Whatever is left of the interval is now simply idle. It used to
 					# be spent re-inferencing recorded clips to annotate them.

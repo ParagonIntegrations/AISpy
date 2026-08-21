@@ -5,14 +5,21 @@ takes effect without a redeploy. Settings that are *not* here stay in settings.p
 purpose - see settings.example.py for what is left and why.
 
 Each spec carries enough metadata to build a settings menu out of, so a new tunable is
-one entry here rather than a new handler in telegrambot.py.
+one entry here rather than a new handler in telegrambot.py. STREAM_FIELDS at the bottom
+does the same job for the per-stream columns, so the stream editor is generated too.
 """
 
 import datetime
+import functools
+import re
+from pathlib import Path
+
+import yaml
 
 # Kinds understood by Spec. 'seconds' is stored as a float and handed out as a
-# timedelta, because that is what the callers do arithmetic with.
-KINDS = ('int', 'float', 'bool', 'str', 'seconds', 'int_list')
+# timedelta, because that is what the callers do arithmetic with. 'dimensions' is a
+# (width, height) pair.
+KINDS = ('int', 'float', 'bool', 'str', 'seconds', 'int_list', 'dimensions')
 
 TRUE_WORDS = ('1', 'true', 'yes', 'on', 'y', 'enabled')
 FALSE_WORDS = ('0', 'false', 'no', 'off', 'n', 'disabled')
@@ -20,7 +27,8 @@ FALSE_WORDS = ('0', 'false', 'no', 'off', 'n', 'disabled')
 
 class Spec:
 	def __init__(self, name, kind, default, category, label, description='',
-				 minimum=None, maximum=None):
+				 minimum=None, maximum=None, optional=False, unset_label='(unset)',
+				 parser=None):
 		assert kind in KINDS, f'unknown kind {kind}'
 		self.name = name
 		self.kind = kind
@@ -29,6 +37,12 @@ class Spec:
 		self.description = description
 		self.minimum = minimum
 		self.maximum = maximum
+		# An optional field stores None for 'leave this alone', which is not the same as
+		# its default: an unset detect_url means 'use url', not 'use no url'.
+		self.optional = optional
+		self.unset_label = unset_label
+		# For fields whose typed form is not their stored form, like class names.
+		self.parser = parser
 		self.default = self.coerce(default)
 
 	# -- conversions ---------------------------------------------------------
@@ -39,6 +53,8 @@ class Spec:
 		Used on the way in from the legacy settings.py, from the database and from the
 		admin panel alike, so a bad value fails at one place instead of at the reader.
 		"""
+		if self.optional and (value is None or (isinstance(value, str) and not value.strip())):
+			return None
 		if self.kind == 'int':
 			value = int(value)
 		elif self.kind == 'float':
@@ -52,7 +68,20 @@ class Spec:
 				value = datetime.timedelta(seconds=float(value))
 		elif self.kind == 'int_list':
 			value = [int(item) for item in value]
+		elif self.kind == 'dimensions':
+			value = self.coerce_dimensions(value)
 		return self.check_range(value)
+
+	def coerce_dimensions(self, value):
+		"""'1920x1080', '1920, 1080' or any two-item sequence -> (1920, 1080)."""
+		parts = [part for part in re.split(r'[^0-9]+', value) if part] \
+			if isinstance(value, str) else list(value)
+		if len(parts) != 2:
+			raise ValueError(f'{self.label} wants a width and a height, like 1920x1080')
+		width, height = (int(part) for part in parts)
+		if width <= 0 or height <= 0:
+			raise ValueError(f'{self.label} must be positive')
+		return (width, height)
 
 	def check_range(self, value):
 		if self.minimum is None and self.maximum is None:
@@ -70,6 +99,8 @@ class Spec:
 			return value.total_seconds()
 		if self.kind == 'bool':
 			return bool(value)
+		if self.kind == 'dimensions' and value is not None:
+			return list(value)
 		return value
 
 	def decode(self, stored):
@@ -79,6 +110,10 @@ class Spec:
 	def parse(self, text):
 		"""Parse what an admin typed into the bot."""
 		text = text.strip()
+		if self.optional and not text:
+			return None
+		if self.parser is not None:
+			return self.coerce(self.parser(text))
 		if self.kind == 'bool':
 			lowered = text.lower()
 			if lowered in TRUE_WORDS:
@@ -92,12 +127,16 @@ class Spec:
 
 	def format(self, value) -> str:
 		"""Render a value for a Telegram message."""
+		if value is None:
+			return self.unset_label
 		if self.kind == 'bool':
 			return 'on' if value else 'off'
 		if self.kind == 'seconds':
 			return f'{value.total_seconds():g}s'
 		if self.kind == 'int_list':
 			return ', '.join(str(item) for item in value) or '(empty)'
+		if self.kind == 'dimensions':
+			return f'{value[0]}x{value[1]}'
 		if self.kind == 'str':
 			return value or '(unset)'
 		return str(value)
@@ -172,3 +211,120 @@ CATEGORY_LABELS = {
 
 def specs_in(category) -> list:
 	return [spec for spec in SPECS if spec.category == category]
+
+
+# -- per-stream fields -------------------------------------------------------
+#
+# The stream editor in the admin panel is generated from this table, the same way the
+# tunables menu is generated from SPECS. Two columns are deliberately absent: `armed` is
+# runtime state that the arm/disarm buttons own, and `recordcounter` is the detector's
+# own counter. `detect` and `record` are absent too - they are in the schema but nothing
+# reads them, so a toggle for either would do nothing.
+
+# Class ids as coco.yaml numbers them. Shipped with the model, so the file is read from
+# next to it rather than from the container path detector_config hard-codes.
+COCO_NAMES_PATH = Path(__file__).parent / 'detector' / 'models' / 'cfg' / 'coco.yaml'
+
+# What a security camera is usually pointed at, offered as toggles. Everything else in
+# coco.yaml is still reachable by typing its name or id.
+COMMON_CLASSES = (0, 2, 7, 3, 1, 16, 15)
+
+
+@functools.lru_cache(maxsize=1)
+def class_names() -> dict:
+	"""{id: name} for the model's classes, empty if coco.yaml cannot be read.
+
+	Falling back to empty rather than raising: not being able to pretty-print a class
+	name is no reason for the admin panel to refuse to open.
+	"""
+	try:
+		return {int(key): str(value)
+				for key, value in yaml.safe_load(COCO_NAMES_PATH.read_text())['names'].items()}
+	except Exception:
+		return {}
+
+
+def class_label(class_id) -> str:
+	name = class_names().get(int(class_id))
+	return f'{name} ({class_id})' if name else str(class_id)
+
+
+def format_classes(class_ids) -> str:
+	if not class_ids:
+		return '(everything)'
+	return ', '.join(class_names().get(int(item), str(item)) for item in class_ids)
+
+
+def resolve_classes(text) -> list:
+	"""'dog, 2, person' -> [0, 2, 16], raising on anything unrecognised.
+
+	Sorted rather than kept in the order they were typed, so a list built by typing and
+	one built from the toggle buttons read the same on the way back out.
+	"""
+	names_by_id = class_names()
+	ids_by_name = {name.lower(): class_id for class_id, name in names_by_id.items()}
+	resolved = []
+	for part in (part.strip() for part in text.replace(',', ' ').split()):
+		if not part:
+			continue
+		if part.isdigit():
+			class_id = int(part)
+			# Without coco.yaml we cannot tell a valid id from a typo, so let it through.
+			if names_by_id and class_id not in names_by_id:
+				raise ValueError(f'There is no class {class_id}')
+		elif part.lower() in ids_by_name:
+			class_id = ids_by_name[part.lower()]
+		else:
+			raise ValueError(f'Unknown class {part!r}')
+		if class_id not in resolved:
+			resolved.append(class_id)
+	return sorted(resolved)
+
+
+class StreamField(Spec):
+	"""One editable column of a stream.
+
+	`requires_restart` is the interesting part: stream configuration is read once when
+	the stream processes are forked, so almost every change here is inert until the app
+	restarts. The name is the exception - it is only ever read to label a button.
+	"""
+
+	def __init__(self, name, kind, default, label, description='', minimum=None,
+				 maximum=None, optional=False, unset_label='(unset)', parser=None,
+				 requires_restart=True):
+		super().__init__(name, kind, default, 'stream', label, description,
+						 minimum=minimum, maximum=maximum, optional=optional,
+						 unset_label=unset_label, parser=parser)
+		self.requires_restart = requires_restart
+
+
+STREAM_FIELDS = (
+	StreamField('name', 'str', '', 'Name',
+				'What this camera is called in the panel and on the arm/disarm buttons.',
+				optional=True, unset_label='(none)', requires_restart=False),
+	StreamField('url', 'str', '', 'URL',
+				'The stream the clips are recorded from, usually the camera main stream.'),
+	StreamField('detect_url', 'str', '', 'Detect URL',
+				'Stream the detection frames are decoded from. A camera substream costs '
+				'far less to decode. Leave it unset to detect on the recording URL.',
+				optional=True, unset_label='(same as URL)'),
+	StreamField('dimensions', 'dimensions', (1920, 1080), 'Dimensions',
+				'Frame size of the recording stream, as WxH. The detect area is written '
+				'in these coordinates and is rescaled when this changes.'),
+	StreamField('detect_dimensions', 'dimensions', None, 'Detect dimensions',
+				'Frames are scaled to this before detection. Smaller means fewer bytes '
+				'down the pipe and a smaller frame buffer.',
+				optional=True, unset_label='(same as Dimensions)'),
+	StreamField('detection_classes', 'int_list', [0], 'Classes',
+				'Which objects raise an event. Empty means everything the model knows.',
+				parser=resolve_classes),
+	StreamField('confidence_threshold', 'float', 0.5, 'Confidence',
+				'How sure the model has to be before a detection counts.',
+				minimum=0.0, maximum=1.0),
+	StreamField('lite_aspect_ratio', 'bool', False, 'Lite aspect ratio',
+				'For cameras whose substream is anamorphic - half width, stretched back '
+				'out on playback. Tags clips with a 2:1 pixel aspect instead of '
+				're-encoding them.'),
+)
+
+STREAM_FIELDS_BY_NAME = {field.name: field for field in STREAM_FIELDS}

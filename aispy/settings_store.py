@@ -7,8 +7,8 @@ itself after its next supervisor restart all carried on with the old list. Setti
 an admin can change have to live somewhere all the processes can see, which means the
 database.
 
-Each process gets its own connection (sqlite3 connections are not fork-safe) and its own
-read cache. The cache is dropped when PRAGMA data_version reports that another connection
+Each process gets its own connection (sqlite3 connections are not fork-safe, though they
+are shared across the threads of one process) and its own read cache. The cache is dropped when PRAGMA data_version reports that another connection
 has committed, so a change made in the bot reaches the detector without a restart. What
 is *not* live is anything consumed once at startup - stream URLs and geometry are read
 when the stream processes are forked, so editing those still needs a restart.
@@ -26,13 +26,13 @@ import time
 import numpy as np
 
 from autoarm import AutoArm
-from settings_spec import SPECS, SPECS_BY_NAME
+from settings_spec import SPECS, SPECS_BY_NAME, STREAM_FIELDS, STREAM_FIELDS_BY_NAME
 
 # Logging by name rather than by importing utils: utils builds the logger from settings.py
 # at import time and imports back into everything, and this module is a dependency of it.
 logger = logging.getLogger('Main Logger')
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 ROLE_ADMIN = 'admin'
 ROLE_USER = 'user'
@@ -57,8 +57,8 @@ LEGACY_ROLE_ATTRS = {
 }
 
 # Stream columns that are plain scalars, stored as themselves.
-STREAM_SCALAR_COLUMNS = ('url', 'detect_url', 'confidence_threshold', 'detect', 'record',
-						 'lite_aspect_ratio', 'recordcounter')
+STREAM_SCALAR_COLUMNS = ('name', 'url', 'detect_url', 'confidence_threshold', 'detect',
+						 'record', 'lite_aspect_ratio', 'recordcounter')
 # Stream columns held as JSON because they are tuples or lists.
 STREAM_JSON_COLUMNS = ('dimensions', 'detect_dimensions', 'detection_classes', 'detectarea')
 
@@ -114,7 +114,18 @@ class SettingsStore:
 		# isolation_level=None keeps us in autocommit, so reads never sit inside an open
 		# transaction. A stale read snapshot would hide other processes' writes from
 		# data_version, which is the whole propagation mechanism.
-		self._conn = sqlite3.connect(self.dbfile, timeout=30, isolation_level=None)
+		#
+		# check_same_thread=False because a process is not a thread: Telegrambot runs its
+		# local logic on a daemon thread and the Application on the main one, and both
+		# read settings. Whichever got there first would own the connection and the other
+		# would raise ProgrammingError on every access - which, with the read cache
+		# absorbing anything inside the refresh interval, showed up as handlers failing
+		# intermittently rather than as an obvious break. Sharing one connection across
+		# the threads of a process is safe: sqlite3.threadsafety is 3 here (SQLite built
+		# serialized), so it does its own locking, and the caches below are only ever
+		# touched by single dict and list operations, which the GIL already makes atomic.
+		self._conn = sqlite3.connect(self.dbfile, timeout=30, isolation_level=None,
+									 check_same_thread=False)
 		self._conn.row_factory = sqlite3.Row
 		# WAL so the bot can write settings while the detector is reading them.
 		self._conn.execute('PRAGMA journal_mode=WAL')
@@ -137,6 +148,12 @@ class SettingsStore:
 			version = self._schema_version()
 			if version < 2:
 				self._upgrade_to_v2(seed_streams=not fresh)
+			if version < 3:
+				self._upgrade_to_v3()
+			# The master arm/disarm switch has to exist before anything can read it. An
+			# install seeded from settings.py always had it; one configured entirely from
+			# the panel would not, and FractalApp goes straight to streaminfos[0].
+			conn.execute('INSERT OR IGNORE INTO streaminfos(streamid, armed) VALUES(0, 1)')
 			self._set_meta('schema_version', SCHEMA_VERSION)
 			conn.execute('COMMIT')
 		except Exception:
@@ -199,6 +216,11 @@ class SettingsStore:
 			'SELECT value FROM schema_meta WHERE key = ?', ('schema_version',)).fetchone()
 		return int(row['value']) if row else 1
 
+	def _get_meta(self, key, default=None):
+		row = self.conn.execute(
+			'SELECT value FROM schema_meta WHERE key = ?', (key,)).fetchone()
+		return default if row is None else json.loads(row['value'])
+
 	def _set_meta(self, key, value) -> None:
 		self.conn.execute('''
 			INSERT INTO schema_meta(key, value) VALUES(?, ?)
@@ -228,6 +250,12 @@ class SettingsStore:
 		conn.execute(
 			'CREATE UNIQUE INDEX IF NOT EXISTS streaminfos_streamid ON streaminfos(streamid)')
 		self._migrate_from_file()
+
+	def _upgrade_to_v3(self) -> None:
+		"""Give streams a name, so the panel can list cameras rather than numbers."""
+		existing = {row['name'] for row in self.conn.execute('PRAGMA table_info(streaminfos)')}
+		if 'name' not in existing:
+			self.conn.execute('ALTER TABLE streaminfos ADD COLUMN name TEXT')
 
 	# -- migration off settings.py -------------------------------------------
 
@@ -464,31 +492,76 @@ class SettingsStore:
 		self._timers = live
 		return list(live.values())
 
-	def add_timer(self, hour, minute=0, repeat_every_days=1, active_days=None,
-				  do_arm=True, enabled=True) -> int:
-		active_days = list(range(7)) if active_days is None else sorted(set(active_days))
+	@staticmethod
+	def check_time(hour, minute):
 		if not 0 <= int(hour) <= 23 or not 0 <= int(minute) <= 59:
 			raise ValueError('Time must be between 00:00 and 23:59')
-		if not active_days or any(day not in range(7) for day in active_days):
+		return int(hour), int(minute)
+
+	@staticmethod
+	def check_days(active_days) -> list:
+		active_days = sorted({int(day) for day in active_days})
+		# Told apart because the panel reaches the first one by turning the last day off,
+		# where 'must be 0 to 6' says nothing about what went wrong.
+		if not active_days:
+			raise ValueError('A timer needs at least one day')
+		if any(day not in range(7) for day in active_days):
 			raise ValueError('Days must be 0 (Monday) to 6 (Sunday)')
+		return active_days
+
+	def add_timer(self, hour, minute=0, repeat_every_days=1, active_days=None,
+				  do_arm=True, enabled=True) -> int:
+		active_days = self.check_days(range(7) if active_days is None else active_days)
+		hour, minute = self.check_time(hour, minute)
 		cursor = self.conn.execute('''
 			INSERT INTO autoarm_timers(
 				hour, minute, repeat_every_days, active_days, do_arm, enabled
 			) VALUES(?, ?, ?, ?, ?, ?)
-		''', (int(hour), int(minute), max(1, int(repeat_every_days)),
-			  json.dumps([int(day) for day in active_days]),
-			  1 if do_arm else 0, 1 if enabled else 0))
+		''', (hour, minute, max(1, int(repeat_every_days)),
+			  json.dumps(active_days), 1 if do_arm else 0, 1 if enabled else 0))
 		self.reload()
 		return cursor.lastrowid
+
+	def update_timer(self, timer_id, **fields) -> None:
+		"""Change one or more fields of an existing timer.
+
+		Editing rather than delete-and-recreate keeps the row id, so whichever message
+		the admin is looking at still addresses the same timer. The AutoArm instance is
+		rebuilt on the next poll because the cache key covers every field here, and a
+		rebuilt timer takes its next_time from now - so moving a timer earlier in the day
+		does not make it fire retroactively.
+		"""
+		unknown = set(fields) - {'hour', 'minute', 'repeat_every_days', 'active_days',
+								 'do_arm', 'enabled'}
+		if unknown:
+			raise ValueError(f'Not a timer field: {", ".join(sorted(unknown))}')
+		if not fields:
+			return
+		if 'hour' in fields or 'minute' in fields:
+			row = self.timer_row(timer_id)
+			if row is None:
+				raise ValueError('That timer no longer exists')
+			fields['hour'], fields['minute'] = self.check_time(
+				fields.get('hour', row['hour']), fields.get('minute', row['minute']))
+		if 'active_days' in fields:
+			fields['active_days'] = json.dumps(self.check_days(fields['active_days']))
+		if 'repeat_every_days' in fields:
+			fields['repeat_every_days'] = max(1, int(fields['repeat_every_days']))
+		if 'do_arm' in fields:
+			fields['do_arm'] = 1 if fields['do_arm'] else 0
+		if 'enabled' in fields:
+			fields['enabled'] = 1 if fields['enabled'] else 0
+		assignments = ', '.join(f'{column} = ?' for column in fields)
+		self.conn.execute(f'UPDATE autoarm_timers SET {assignments} WHERE id = ?',
+						  list(fields.values()) + [int(timer_id)])
+		self.reload()
 
 	def remove_timer(self, timer_id) -> None:
 		self.conn.execute('DELETE FROM autoarm_timers WHERE id = ?', (int(timer_id),))
 		self.reload()
 
 	def set_timer_enabled(self, timer_id, enabled) -> None:
-		self.conn.execute('UPDATE autoarm_timers SET enabled = ? WHERE id = ?',
-						  (1 if enabled else 0, int(timer_id)))
-		self.reload()
+		self.update_timer(timer_id, enabled=enabled)
 
 	# -- streams -------------------------------------------------------------
 
@@ -540,6 +613,10 @@ class SettingsStore:
 
 	@staticmethod
 	def _encode_stream_field(column, value):
+		# An optional field that is not set is a NULL, not an encoded None: detect_url
+		# unset means 'use url', and json.dumps would turn that into the string 'null'.
+		if value is None:
+			return None
 		if column in STREAM_JSON_COLUMNS:
 			if isinstance(value, np.ndarray):
 				value = value.tolist()
@@ -553,14 +630,148 @@ class SettingsStore:
 						  (int(streamid), int(streaminfo.get('armed', 0))))
 		self._write_stream(int(streamid), streaminfo)
 
+	def next_streamid(self) -> int:
+		row = self.conn.execute('SELECT MAX(streamid) AS top FROM streaminfos').fetchone()
+		return int(row['top'] or 0) + 1
+
+	# -- streams, as the admin panel sees them -------------------------------
+
+	def stream_rows(self) -> list:
+		"""Every real stream, as dicts of decoded field values. Stream 0 is not one.
+
+		Read straight from the connection rather than from the cache the scalar settings
+		use: this is only ever called while drawing a menu, and being a poll behind would
+		show an admin their own edit not having happened.
+		"""
+		return [self._stream_fields(row) for row in self.conn.execute(
+			'SELECT * FROM streaminfos WHERE streamid != 0 ORDER BY streamid')]
+
+	def stream_row(self, streamid):
+		row = self.conn.execute('SELECT * FROM streaminfos WHERE streamid = ? AND streamid != 0',
+								(int(streamid),)).fetchone()
+		return None if row is None else self._stream_fields(row)
+
+	def _stream_fields(self, row) -> dict:
+		"""One row as {streamid, armed, <every field in STREAM_FIELDS>}.
+
+		A column that has never been written, or that holds something the field can no
+		longer make sense of, comes back as the field default rather than raising: a bad
+		value in one column should not make the stream uneditable.
+		"""
+		fields = {'streamid': row['streamid'], 'armed': int(row['armed'] or 0)}
+		for field in STREAM_FIELDS:
+			stored = row[field.name]
+			if stored is None:
+				fields[field.name] = field.default
+				continue
+			if field.name in STREAM_JSON_COLUMNS:
+				stored = json.loads(stored)
+			try:
+				fields[field.name] = field.coerce(stored)
+			except Exception:
+				logger.warning(
+					f'Stream {row["streamid"]} has an unusable {field.name}, showing the default')
+				fields[field.name] = field.default
+		return fields
+
+	def stream_name(self, streamid) -> str:
+		"""What to call a stream on a button. Cheap enough to call per keyboard."""
+		if int(streamid) == 0:
+			return 'All'
+		row = self.conn.execute('SELECT name FROM streaminfos WHERE streamid = ?',
+								(int(streamid),)).fetchone()
+		name = (row['name'] or '').strip() if row is not None else ''
+		return name or f'Stream {streamid}'
+
+	def add_stream(self, url, dimensions=None, name=None) -> int:
+		"""Create a stream from a URL, with every other field at its default.
+
+		The detect area is the whole frame, which is the only sensible thing to write
+		without being able to see the picture. The panel never touches it again, so a
+		polygon put there by hand survives everything the admin can do from Telegram.
+		"""
+		field = STREAM_FIELDS_BY_NAME['url']
+		url = field.coerce(url)
+		if not url:
+			raise ValueError('A stream needs a URL')
+		dimensions = STREAM_FIELDS_BY_NAME['dimensions'].coerce(
+			dimensions if dimensions is not None else STREAM_FIELDS_BY_NAME['dimensions'].default)
+		streamid = self.next_streamid()
+		# Armed by default: the master switch still gates it, so a new camera comes up in
+		# whatever state the system as a whole is in rather than silently watching nothing.
+		self.conn.execute('INSERT INTO streaminfos(streamid, armed) VALUES(?, 1)', (streamid,))
+		values = {each.name: each.default for each in STREAM_FIELDS}
+		values.update({'url': url, 'dimensions': dimensions,
+					   'name': STREAM_FIELDS_BY_NAME['name'].coerce(name)})
+		values['detectarea'] = self.full_frame(dimensions)
+		self._write_stream(streamid, values)
+		self.mark_streams_dirty()
+		return streamid
+
+	@staticmethod
+	def full_frame(dimensions) -> list:
+		width, height = dimensions
+		return [[0, 0], [width, 0], [width, height], [0, height]]
+
+	def set_stream_field(self, streamid, name, value):
+		"""Write one field of one stream, and say whether that needs a restart."""
+		field = STREAM_FIELDS_BY_NAME[name]
+		value = field.coerce(value)
+		if name == 'url' and not value:
+			raise ValueError('A stream needs a URL')
+		row = self.stream_row(streamid)
+		if row is None:
+			raise ValueError('That stream no longer exists')
+		changes = {name: value}
+		if name == 'dimensions' and tuple(value) != tuple(row['dimensions']):
+			changes['detectarea'] = self.rescaled_detectarea(streamid, row['dimensions'], value)
+		self._write_stream(int(streamid), changes)
+		if field.requires_restart:
+			self.mark_streams_dirty()
+		return value
+
+	def rescaled_detectarea(self, streamid, old_dimensions, new_dimensions) -> list:
+		"""Move the detect area into the new coordinate space.
+
+		The area is written against `dimensions`, so leaving it alone when those change
+		would silently point it at the wrong part of the picture. A whole-frame area
+		stays a whole-frame area and a hand-drawn one keeps its shape, which is the same
+		thing app.init_detect_geometry does when scaling into detect_dimensions.
+		"""
+		row = self.conn.execute('SELECT detectarea FROM streaminfos WHERE streamid = ?',
+								(int(streamid),)).fetchone()
+		if row is None or row['detectarea'] is None:
+			return self.full_frame(new_dimensions)
+		try:
+			points = np.array(json.loads(row['detectarea']), dtype=float)
+			scale = np.array([new_dimensions[0] / old_dimensions[0],
+							  new_dimensions[1] / old_dimensions[1]])
+			return (points * scale).astype(int).tolist()
+		except Exception:
+			logger.exception(f'Could not rescale the detect area of stream {streamid}')
+			return self.full_frame(new_dimensions)
+
 	def remove_stream(self, streamid) -> None:
 		if int(streamid) == 0:
 			raise ValueError('Stream 0 is the master arm/disarm switch and cannot be removed')
 		self.conn.execute('DELETE FROM streaminfos WHERE streamid = ?', (int(streamid),))
+		self.mark_streams_dirty()
 
-	def next_streamid(self) -> int:
-		row = self.conn.execute('SELECT MAX(streamid) AS top FROM streaminfos').fetchone()
-		return int(row['top'] or 0) + 1
+	# -- pending restart -----------------------------------------------------
+	#
+	# Stream configuration is read once, when FractalApp forks the stream processes, so
+	# an edit made in the panel is inert until the app comes back up. The flag is set by
+	# every write above and cleared once those processes have been built from the new
+	# rows, which is the only moment the database and what is running are known to agree.
+
+	def streams_dirty(self) -> bool:
+		return bool(self._get_meta('streams_dirty', False))
+
+	def mark_streams_dirty(self) -> None:
+		self._set_meta('streams_dirty', True)
+
+	def clear_streams_dirty(self) -> None:
+		self._set_meta('streams_dirty', False)
 
 	# -- armed state ---------------------------------------------------------
 
