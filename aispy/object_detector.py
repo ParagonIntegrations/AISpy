@@ -10,6 +10,7 @@ from utils import mainlogger
 from detector import create_detector
 from detector.detector_api import DetectorAPI
 from detector.detectors.rknn import RknnDetectorConfig
+from movement_tracker import MovementTracker, MOVING, STATE_NAMES
 
 class ObjectDetector(mp.Process):
 
@@ -24,11 +25,23 @@ class ObjectDetector(mp.Process):
 		self.detectorload = detectorload
 		self.model: DetectorAPI | None = None
 		self.zones = {}
+		self.trackers = {}
+		# Refreshed at the top of every pass, like the other live settings.
+		self.stationary_time = 5.0
+		self.movement_threshold = 0.15
 		self.boxannotator = sv.BoxAnnotator(
 			thickness=2,
 			text_thickness=2,
 			text_scale=1,
 			color=sv.Color.BLUE
+		)
+		# Objects that were found but did not count, drawn so a notification shows why
+		# nothing fired rather than looking like the detector missed the car entirely.
+		self.suppressedannotator = sv.BoxAnnotator(
+			thickness=2,
+			text_thickness=2,
+			text_scale=1,
+			color=sv.Color(128, 128, 128)
 		)
 
 
@@ -44,6 +57,8 @@ class ObjectDetector(mp.Process):
 					# panel takes effect without restarting the detector.
 					detections_for_event = self.settings.get('detections_for_event')
 					check_detection_time = self.settings.get('check_detection_time')
+					self.stationary_time = self.settings.get('stationary_time').total_seconds()
+					self.movement_threshold = self.settings.get('movement_threshold')
 					# Get one frame from each camera for processing, This happens as per the settings
 					mainlogger.debug(f'Checking all streams for objects')
 					framebuff: list[tuple] = []
@@ -135,19 +150,63 @@ class ObjectDetector(mp.Process):
 			self.zones[key] = sv.PolygonZone(polygon, (width, height))
 		return self.zones[key]
 
+	def tracker_for(self, streamid) -> MovementTracker:
+		"""This stream's movement memory, started the first time it is asked for.
+
+		Started lazily rather than in __init__ so the warm-up runs from the first frame
+		the stream actually delivers, not from whenever the process happened to fork.
+		"""
+		if streamid not in self.trackers:
+			self.trackers[streamid] = MovementTracker(started=time.monotonic())
+		return self.trackers[streamid]
+
+	def classes_for(self, streamid) -> tuple:
+		"""(classes to ask the model for, the ones that only count while moving).
+
+		The two configured lists are separate groups rather than a set and a subset, so
+		the model has to be asked for both - but an empty detection_classes already means
+		'everything the model knows', and adding to everything is still everything.
+		"""
+		streaminfo = self.streaminfos[streamid]
+		presence = list(streaminfo.get('detection_classes') or [])
+		motion = set(streaminfo.get('motion_classes') or [])
+		requested = [] if not presence else sorted(set(presence) | motion)
+		return requested, motion
+
+	def counting_mask(self, detections, states, motion_classes) -> np.ndarray:
+		"""Which detections are allowed to raise an event.
+
+		Anything outside the motion-only group counts on sight, exactly as it always
+		did. Anything inside it counts only while the tracker says it is moving, so a
+		parked car is found, drawn, and ignored.
+		"""
+		if not len(detections):
+			return np.zeros(0, dtype=bool)
+		return np.array([class_id not in motion_classes or state == MOVING
+						 for class_id, state in zip(detections.class_id, states)],
+						dtype=bool)
+
 	def doinference(self, frame, streamid, double_check=True, motion_detections=None) -> tuple:
 		starttime = datetime.now().timestamp()
 		confidence = self.streaminfos[streamid]['confidence_threshold']
-		classes = self.streaminfos[streamid]['detection_classes']
+		classes, motion_classes = self.classes_for(streamid)
 		if motion_detections is None:
 			detections = self.model.detect(frame, classes=classes, conf=confidence,
 										nms=True, iou=0.5, verbose=False)
 		else:
 			detections = motion_detections
+		# Movement is judged on the whole frame, before the detect area is applied: a car
+		# approaching from outside the zone has already been seen moving by the time it
+		# crosses in, instead of arriving as an unknown and wasting a cycle.
+		states = self.tracker_for(streamid).update(
+			detections.xyxy, detections.class_id, time.monotonic(),
+			self.stationary_time, self.movement_threshold)
 		zone = self.zone_for(streamid, frame)
-		zone_detections = detections[zone.trigger(detections=detections)]
+		zone_mask = zone.trigger(detections=detections)
+		zone_detections = detections[zone_mask]
+		states = states[zone_mask]
 		# Zoom in and recheck if an object is found
-		if zone_detections and double_check:
+		if len(zone_detections) and double_check:
 			verified = []
 			for detection in zone_detections:
 				x1, y1, x2, y2 = detection[0].astype(int)
@@ -166,12 +225,37 @@ class ObjectDetector(mp.Process):
 					verified.append(True)
 				else:
 					verified.append(False)
+			verified = np.array(verified, dtype=bool)
 			zone_detections = zone_detections[verified]
-		zone_annotated_frame = draw_polygon(frame, zone.polygon, color=sv.Color.GREEN)
-		labels = [f'{self.model.model_names[class_id]} {conf: 0.2f}'
-				  for class_id, conf in zip(zone_detections.class_id, detections.confidence)]
-		annotated_frame = self.boxannotator.annotate(zone_annotated_frame, detections=zone_detections, labels=labels)
-		num_detections = len(labels)
+			states = states[verified]
+		counting = self.counting_mask(zone_detections, states, motion_classes)
+		annotated_frame = draw_polygon(frame, zone.polygon, color=sv.Color.GREEN)
+		# The suppressed boxes go on first, so a car that did not count cannot draw over
+		# the person standing next to it who did.
+		suppressed = zone_detections[~counting]
+		if len(suppressed):
+			annotated_frame = self.suppressedannotator.annotate(
+				annotated_frame, detections=suppressed,
+				labels=self.labels_for(suppressed, states[~counting], motion_classes))
+		counted = zone_detections[counting]
+		annotated_frame = self.boxannotator.annotate(
+			annotated_frame, detections=counted,
+			labels=self.labels_for(counted, states[counting], motion_classes))
+		num_detections = len(counted)
 		inferencetime = datetime.now().timestamp() - starttime
 		self.avginferencetime = (self.avginferencetime * 19 + inferencetime) / 20
 		return (annotated_frame, num_detections)
+
+	def labels_for(self, detections, states, motion_classes) -> list:
+		"""'person 0.82', or 'car 0.79 (still)' for a motion-only class.
+
+		The state is only worth printing for classes it actually decides anything for -
+		on the rest it would just be noise about a measurement nothing consulted.
+		"""
+		labels = []
+		for class_id, conf, state in zip(detections.class_id, detections.confidence, states):
+			label = f'{self.model.model_names[class_id]} {conf: 0.2f}'
+			if class_id in motion_classes:
+				label = f'{label} ({STATE_NAMES[int(state)]})'
+			labels.append(label)
+		return labels

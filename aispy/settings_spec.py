@@ -159,6 +159,14 @@ SPECS = (
 		 'Consecutive detections needed before a stream starts recording and the alarm '
 		 'countdown begins.',
 		 minimum=1, maximum=100),
+	Spec('stationary_time', 'seconds', 5.0, 'detection', 'Stationary time',
+		 'How long a motion-only object has to hold still before it stops counting. A '
+		 'car that parks goes quiet this long after it stops.',
+		 minimum=0.1, maximum=3600.0),
+	Spec('movement_threshold', 'float', 0.15, 'detection', 'Movement threshold',
+		 'How far a motion-only object has to shift to count as moving, as a fraction '
+		 'of its own width or height. Raise it if box jitter keeps waking things up.',
+		 minimum=0.001, maximum=10.0),
 	Spec('avg_inference_time', 'float', 0.1, 'detection', 'Seed inference time',
 		 'Starting value for the rolling average of inference time, in seconds.',
 		 minimum=0.0, maximum=60.0),
@@ -316,7 +324,13 @@ STREAM_FIELDS = (
 				'down the pipe and a smaller frame buffer.',
 				optional=True, unset_label='(same as Dimensions)'),
 	StreamField('detection_classes', 'int_list', [0], 'Classes',
-				'Which objects raise an event. Empty means everything the model knows.',
+				'Which objects raise an event just by being there. Empty means '
+				'everything the model knows apart from the motion-only classes.',
+				parser=resolve_classes),
+	StreamField('motion_classes', 'int_list', [], 'Motion classes',
+				'Objects that only raise an event while they are moving, so a parked '
+				'car is ignored and the same car pulling in is not. A separate group '
+				'from Classes, not a subset of it.',
 				parser=resolve_classes),
 	StreamField('confidence_threshold', 'float', 0.5, 'Confidence',
 				'How sure the model has to be before a detection counts.',

@@ -95,6 +95,7 @@ class UserSettings:
 				'detect_dimensions': (960, 540),
 				'detectarea': [[0, 0], [1920, 0], [1920, 1080], [0, 1080]],
 				'detection_classes': [0],
+				'motion_classes': [2, 5, 7],
 				'confidence_threshold': 0.5,
 				'lite_aspect_ratio': False,
 			},
@@ -103,6 +104,14 @@ class UserSettings:
 	draw a polygon on a phone keyboard, and a stream added from Telegram gets the whole
 	frame. Write one here, or into the database, and the panel leaves it alone - it is
 	rescaled if you change 'dimensions' and never otherwise touched.
+
+	'detection_classes' and 'motion_classes' are two separate groups, not a set and a
+	subset of it. A class in the first raises an event just by being there; one in the
+	second only while it is moving, so a parked car is ignored and the same car pulling
+	in is not. The example above alarms on a person standing still, and on a car, bus or
+	truck only while it moves. A class cannot be in both - putting it in one takes it out
+	of the other - and an empty 'detection_classes' means everything the model knows
+	apart from whatever is in 'motion_classes'.
 
 	'detect' and 'record' are accepted for an existing install but nothing reads them.
 	Whether a stream is watched is the per-stream arm/disarm button, and the recorder

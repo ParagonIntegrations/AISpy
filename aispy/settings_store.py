@@ -32,7 +32,7 @@ from settings_spec import SPECS, SPECS_BY_NAME, STREAM_FIELDS, STREAM_FIELDS_BY_
 # at import time and imports back into everything, and this module is a dependency of it.
 logger = logging.getLogger('Main Logger')
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 ROLE_ADMIN = 'admin'
 ROLE_USER = 'user'
@@ -60,9 +60,14 @@ LEGACY_ROLE_ATTRS = {
 STREAM_SCALAR_COLUMNS = ('name', 'url', 'detect_url', 'confidence_threshold', 'detect',
 						 'record', 'lite_aspect_ratio', 'recordcounter')
 # Stream columns held as JSON because they are tuples or lists.
-STREAM_JSON_COLUMNS = ('dimensions', 'detect_dimensions', 'detection_classes', 'detectarea')
+STREAM_JSON_COLUMNS = ('dimensions', 'detect_dimensions', 'detection_classes',
+					   'motion_classes', 'detectarea')
 
 STREAM_COLUMNS = STREAM_SCALAR_COLUMNS + STREAM_JSON_COLUMNS
+
+# The two class groups, each pointing at the one it must not overlap with.
+CLASS_GROUPS = {'detection_classes': 'motion_classes',
+				'motion_classes': 'detection_classes'}
 
 _MISSING = object()
 
@@ -150,6 +155,8 @@ class SettingsStore:
 				self._upgrade_to_v2(seed_streams=not fresh)
 			if version < 3:
 				self._upgrade_to_v3()
+			if version < 4:
+				self._upgrade_to_v4()
 			# The master arm/disarm switch has to exist before anything can read it. An
 			# install seeded from settings.py always had it; one configured entirely from
 			# the panel would not, and FractalApp goes straight to streaminfos[0].
@@ -256,6 +263,17 @@ class SettingsStore:
 		existing = {row['name'] for row in self.conn.execute('PRAGMA table_info(streaminfos)')}
 		if 'name' not in existing:
 			self.conn.execute('ALTER TABLE streaminfos ADD COLUMN name TEXT')
+
+	def _upgrade_to_v4(self) -> None:
+		"""Split the detection classes into ones that count on sight and ones that
+		only count while moving.
+
+		Left empty on an existing stream, which is the same behaviour it had before:
+		every class it detects still counts on sight.
+		"""
+		existing = {row['name'] for row in self.conn.execute('PRAGMA table_info(streaminfos)')}
+		if 'motion_classes' not in existing:
+			self.conn.execute('ALTER TABLE streaminfos ADD COLUMN motion_classes TEXT')
 
 	# -- migration off settings.py -------------------------------------------
 
@@ -725,6 +743,14 @@ class SettingsStore:
 		changes = {name: value}
 		if name == 'dimensions' and tuple(value) != tuple(row['dimensions']):
 			changes['detectarea'] = self.rescaled_detectarea(streamid, row['dimensions'], value)
+		# A class belongs to one group or the other, never both: a class that counts on
+		# sight cannot also be one that has to be moving first. Enforced here rather than
+		# in the panel so it holds for a list that was typed as well as one toggled.
+		if name in CLASS_GROUPS:
+			other = CLASS_GROUPS[name]
+			overlap = set(value) & set(row[other])
+			if overlap:
+				changes[other] = [class_id for class_id in row[other] if class_id not in overlap]
 		self._write_stream(int(streamid), changes)
 		if field.requires_restart:
 			self.mark_streams_dirty()

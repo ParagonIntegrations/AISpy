@@ -28,6 +28,13 @@ from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, MessageHandler, ConversationHandler,
                           ContextTypes, filters)
 
+# The class groups a stream has, keyed by the short token that goes into a callback -
+# Telegram gives callback_data 64 bytes, which is not the place for column names.
+CLASS_GROUPS = {'sight': 'detection_classes', 'motion': 'motion_classes'}
+CLASS_GROUP_KEYS = {column: key for key, column in CLASS_GROUPS.items()}
+OTHER_GROUP = {'sight': 'motion', 'motion': 'sight'}
+CLASS_GROUP_PATTERN = '|'.join(CLASS_GROUPS)
+
 ## Enable logging
 # logging.basicConfig(
 #     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -330,7 +337,7 @@ class Telegrambot(mp.Process):
 
     def field_display(self, field, value) -> str:
         """A field's value as the panel shows it, names rather than class numbers."""
-        if field.name == 'detection_classes':
+        if field.name in CLASS_GROUP_KEYS:
             return format_classes(value)
         return field.format(value)
 
@@ -340,8 +347,8 @@ class Telegrambot(mp.Process):
         for field in STREAM_FIELDS:
             if field.kind == 'bool':
                 callback = f'stream_toggle_{streamid}_{field.name}'
-            elif field.name == 'detection_classes':
-                callback = f'stream_classes_{streamid}'
+            elif field.name in CLASS_GROUP_KEYS:
+                callback = f'stream_classes_{streamid}_{CLASS_GROUP_KEYS[field.name]}'
             else:
                 callback = f'stream_edit_{streamid}_{field.name}'
             keyboard.append([InlineKeyboardButton(
@@ -432,9 +439,11 @@ class Telegrambot(mp.Process):
         lines = [field.label, field.description]
         if row is not None:
             lines.append(f'Current: {self.field_display(field, row[field.name])}')
-        if field.name == 'detection_classes':
+        if field.name in CLASS_GROUP_KEYS:
             lines.append('Type class names or numbers, separated by commas. '
-                         'Send - for everything the model knows.')
+                         'Send - to clear the list.')
+            lines.append('A class listed here is taken off the other list: each one '
+                         'either counts on sight or only while moving, not both.')
         elif field.optional:
             lines.append(f'Send - to clear it back to {field.unset_label}.')
         else:
@@ -506,62 +515,73 @@ class Telegrambot(mp.Process):
 
     # -- detection classes ---------------------------------------------------
 
-    def stream_classes_keyboard(self, streamid, selected) -> InlineKeyboardMarkup:
+    def stream_classes_keyboard(self, streamid, group, row) -> InlineKeyboardMarkup:
         """Toggles for what a security camera is usually pointed at.
 
         The rest of coco.yaml is still reachable, by typing it: eighty paged buttons to
         find 'zebra' is not worth the screens it would take.
+
+        Every class shows which group it is in, not just whether it is in this one, so
+        an admin can see that ticking 'car' here is what took it off the other list.
         """
         names = class_names()
+        selected = row[CLASS_GROUPS[group]]
+        elsewhere = row[CLASS_GROUPS[OTHER_GROUP[group]]]
         keyboard = []
         for index in range(0, len(COMMON_CLASSES), 2):
             keyboard.append([
                 InlineKeyboardButton(
-                    f'{"✓ " if class_id in selected else ""}'
+                    f'{"✓ " if class_id in selected else "· " if class_id in elsewhere else ""}'
                     f'{names.get(class_id, class_id)}',
-                    callback_data=f'stream_class_{streamid}_{class_id}')
+                    callback_data=f'stream_class_{streamid}_{group}_{class_id}')
                 for class_id in COMMON_CLASSES[index:index + 2]])
         keyboard.append([InlineKeyboardButton(
             'Type other classes',
-            callback_data=f'stream_edit_{streamid}_detection_classes')])
+            callback_data=f'stream_edit_{streamid}_{CLASS_GROUPS[group]}')])
         keyboard.append([InlineKeyboardButton('Done', callback_data=f'stream_show_{streamid}')])
         return InlineKeyboardMarkup(keyboard)
 
-    def stream_classes(self, streamid, prefix='') -> tuple:
+    def stream_classes(self, streamid, group, prefix='') -> tuple:
         row = self.settings.stream_row(streamid)
         if row is None:
             return self.stream_menu(self.joined(prefix, 'That stream no longer exists'))
-        selected = row['detection_classes']
-        return (self.joined(prefix, self.stream_title(row),
-                            f'Detecting: {format_classes(selected)}'),
-                self.stream_classes_keyboard(streamid, selected))
+        field = STREAM_FIELDS_BY_NAME[CLASS_GROUPS[group]]
+        other = STREAM_FIELDS_BY_NAME[CLASS_GROUPS[OTHER_GROUP[group]]]
+        return (self.joined(prefix, self.stream_title(row), field.description,
+                            f'{field.label}: {format_classes(row[field.name])}',
+                            f'{other.label} (·): {format_classes(row[other.name])}'),
+                self.stream_classes_keyboard(streamid, group, row))
 
     @restricted_to_admin
     async def stream_classes_entry(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         await query.answer()
-        streamid = int(re.match(r'^stream_classes_(\d+)$', query.data).group(1))
-        await self.show(query, *self.stream_classes(streamid))
+        streamid, group = re.match(r'^stream_classes_(\d+)_(\w+)$', query.data).groups()
+        await self.show(query, *self.stream_classes(int(streamid), group))
 
     @restricted_to_admin
     async def stream_class_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         await query.answer()
-        streamid, class_id = re.match(r'^stream_class_(\d+)_(\d+)$', query.data).groups()
+        streamid, group, class_id = re.match(
+            r'^stream_class_(\d+)_(\w+)_(\d+)$', query.data).groups()
         streamid, class_id = int(streamid), int(class_id)
+        name = CLASS_GROUPS[group]
         row = self.settings.stream_row(streamid)
         if row is None:
-            await self.show(query, *self.stream_classes(streamid))
+            await self.show(query, *self.stream_classes(streamid, group))
             return
-        selected = list(row['detection_classes'])
+        selected = list(row[name])
         if class_id in selected:
             selected.remove(class_id)
         else:
+            # Taking it off the other group is the store's job, so a class cannot end up
+            # counting on sight and only-while-moving at the same time.
             selected.append(class_id)
-        self.settings.set_stream_field(streamid, 'detection_classes', sorted(selected))
-        mainlogger.info(f'{update.effective_user.id} set stream {streamid} classes to '
+        self.settings.set_stream_field(streamid, name, sorted(selected))
+        mainlogger.info(f'{update.effective_user.id} set stream {streamid} {name} to '
                         f'{format_classes(selected)}')
-        await self.show(query, *self.stream_classes(streamid))
+        await self.show(query, *self.stream_classes(streamid, group))
 
     # -- deleting ------------------------------------------------------------
 
@@ -1347,8 +1367,12 @@ class Telegrambot(mp.Process):
                     CallbackQueryHandler(self.stream_show, pattern=r'^stream_show_\d+$'),
                     CallbackQueryHandler(self.stream_edit, pattern=r'^stream_edit_\d+_\w+$'),
                     CallbackQueryHandler(self.stream_toggle, pattern=r'^stream_toggle_\d+_\w+$'),
-                    CallbackQueryHandler(self.stream_classes_entry, pattern=r'^stream_classes_\d+$'),
-                    CallbackQueryHandler(self.stream_class_toggle, pattern=r'^stream_class_\d+_\d+$'),
+                    CallbackQueryHandler(
+                        self.stream_classes_entry,
+                        pattern=rf'^stream_classes_\d+_({CLASS_GROUP_PATTERN})$'),
+                    CallbackQueryHandler(
+                        self.stream_class_toggle,
+                        pattern=rf'^stream_class_\d+_({CLASS_GROUP_PATTERN})_\d+$'),
                     CallbackQueryHandler(self.stream_remove, pattern=r'^stream_remove_\d+$'),
                     CallbackQueryHandler(self.stream_delete, pattern=r'^stream_delete_\d+$'),
                     CallbackQueryHandler(self.system_management_entry, pattern='^system_management_show$'),
