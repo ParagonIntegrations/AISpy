@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import time
 from functools import wraps
@@ -719,11 +720,19 @@ class Telegrambot(mp.Process):
 
     @restricted_to_admin
     async def restart_docker(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Bring the whole app down so the container's restart policy starts it again.
+
+        SIGTERM rather than SIGKILL, and at the parent rather than at pid 1 by number.
+        The app is pid 1 inside the container, and a namespace's init cannot be killed
+        from inside it: the kernel drops SIGKILL aimed at it and delivers nothing else
+        it has no handler for. FractalApp.request_restart is that handler; without it
+        this button reported 'Restarting' and did nothing at all.
+        """
         query = update.callback_query
         await query.answer()
         reply_str = 'Restarting'
         await query.edit_message_text(text=reply_str)
-        os.kill(1, 9)
+        os.kill(os.getppid(), signal.SIGTERM)
 
     # Timer Management Section
     #

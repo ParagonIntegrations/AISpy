@@ -1,3 +1,5 @@
+import os
+import signal
 import threading
 import time
 
@@ -110,7 +112,28 @@ class FractalApp:
 				{streamid: streaminfo['armed'].value
 				 for streamid, streaminfo in self.streaminfos.items()})
 
+	def request_restart(self, signum, frame):
+		"""Exit on SIGTERM, so the container's restart policy starts everything again.
+
+		This is what makes the panel's Restart button, and `docker stop`, work at all:
+		the app is pid 1 inside the container, and the kernel discards SIGKILL sent to a
+		namespace's init from inside it and delivers other signals only if init has a
+		handler installed. Without one there was nothing for the button to hit.
+
+		os._exit rather than an orderly shutdown, because there is no orderly shutdown to
+		run: multiprocessing joins every non-daemon child at exit, and the streams, the
+		detector and the bot are all loops that never return, so exiting politely would
+		hang here forever. Nothing is lost by leaving now - settings are committed as they
+		are written and the recorder's segments are already on disk - and pid 1 dying
+		takes the rest of the container with it.
+		"""
+		mainlogger.info(f'Signal {signum} received, exiting for a restart')
+		os._exit(0)
+
 	def run(self):
+		# Installed before anything is forked so it is in place for the whole life of the
+		# app, including the window while the streams are still coming up.
+		signal.signal(signal.SIGTERM, self.request_restart)
 		# Create the streams
 		for streamid in list(self.streaminfos.keys()):
 			if streamid == 0:
