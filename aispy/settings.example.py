@@ -110,8 +110,8 @@ class UserSettings:
 	second only while it is moving, so a parked car is ignored and the same car pulling
 	in is not. The example above alarms on a person standing still, and on a car, bus or
 	truck only while it moves. A class cannot be in both - putting it in one takes it out
-	of the other - and an empty 'detection_classes' means everything the model knows
-	apart from whatever is in 'motion_classes'.
+	of the other - and an empty group holds nothing rather than everything, so a stream
+	with both empty is looked at and never alarms.
 
 	'detect' and 'record' are accepted for an existing install but nothing reads them.
 	Whether a stream is watched is the per-stream arm/disarm button, and the recorder

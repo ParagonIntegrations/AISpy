@@ -259,7 +259,7 @@ def class_label(class_id) -> str:
 
 def format_classes(class_ids) -> str:
 	if not class_ids:
-		return '(everything)'
+		return '(none)'
 	return ', '.join(class_names().get(int(item), str(item)) for item in class_ids)
 
 
@@ -324,8 +324,8 @@ STREAM_FIELDS = (
 				'down the pipe and a smaller frame buffer.',
 				optional=True, unset_label='(same as Dimensions)'),
 	StreamField('detection_classes', 'int_list', [0], 'Classes',
-				'Which objects raise an event just by being there. Empty means '
-				'everything the model knows apart from the motion-only classes.',
+				'Which objects raise an event just by being there. Empty means none of '
+				'them, so a stream with no classes in either group detects nothing.',
 				parser=resolve_classes),
 	StreamField('motion_classes', 'int_list', [], 'Motion classes',
 				'Objects that only raise an event while they are moving, so a parked '

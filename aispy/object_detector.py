@@ -164,14 +164,13 @@ class ObjectDetector(mp.Process):
 		"""(classes to ask the model for, the ones that only count while moving).
 
 		The two configured lists are separate groups rather than a set and a subset, so
-		the model has to be asked for both - but an empty detection_classes already means
-		'everything the model knows', and adding to everything is still everything.
+		the model has to be asked for the union of them. An empty group means no class
+		is in it, so a stream with both empty is watching for nothing at all.
 		"""
 		streaminfo = self.streaminfos[streamid]
-		presence = list(streaminfo.get('detection_classes') or [])
+		presence = set(streaminfo.get('detection_classes') or [])
 		motion = set(streaminfo.get('motion_classes') or [])
-		requested = [] if not presence else sorted(set(presence) | motion)
-		return requested, motion
+		return sorted(presence | motion), motion
 
 	def counting_mask(self, detections, states, motion_classes) -> np.ndarray:
 		"""Which detections are allowed to raise an event.
@@ -190,6 +189,11 @@ class ObjectDetector(mp.Process):
 		starttime = datetime.now().timestamp()
 		confidence = self.streaminfos[streamid]['confidence_threshold']
 		classes, motion_classes = self.classes_for(streamid)
+		if not classes:
+			# Neither group holds anything, so there is nothing to look for. The model
+			# reads an empty class list as 'all of them', so this has to be caught here
+			# rather than handed down as a filter that filters nothing.
+			return frame, 0
 		if motion_detections is None:
 			detections = self.model.detect(frame, classes=classes, conf=confidence,
 										nms=True, iou=0.5, verbose=False)
