@@ -25,9 +25,22 @@ and coming back looking brand new, so entries that reached STATIONARY are rememb
 far longer than active ones. The flickering car re-matches its own entry, finds its
 anchor where it left it, and stays quiet.
 
-No supervision or model types on purpose: this takes arrays and hands back an array,
-so it can be exercised without a camera or an NPU.
+The other way it goes wrong is a gap in the looking rather than in the seeing. A stream
+that is disarmed overnight is never handed to update() at all, so by morning the memory
+has expired and every parked car is novel - and the warm-up that covers exactly this at
+startup has long since passed. Any gap longer than the stationary memory therefore
+restarts the warm-up: past that point the memory that suppresses parked objects is gone,
+so resuming is a start, whatever the clock says.
+
+Each state comes back with the reason for it - 'novel', 'moved 0.31', 'held 0.04' - so
+an event can be explained after the fact. The three routes to MOVING have three
+different fixes, and the state alone does not say which one was taken.
+
+No supervision or model types on purpose: this takes arrays and hands back arrays, so
+it can be exercised without a camera or an NPU.
 """
+
+from typing import NamedTuple
 
 import numpy as np
 
@@ -36,6 +49,22 @@ MOVING = 1
 STATIONARY = 2
 
 STATE_NAMES = {UNKNOWN: 'unknown', MOVING: 'moving', STATIONARY: 'still'}
+
+
+class Movement(NamedTuple):
+	"""One state and one reason per box, in the order the boxes were given.
+
+	They travel together because the caller filters boxes twice - by detect area, then by
+	the zoomed-in recheck - and a reason that has drifted out of step with its state is
+	worse than no reason at all.
+	"""
+
+	states: np.ndarray
+	reasons: np.ndarray
+
+	def select(self, mask) -> 'Movement':
+		return Movement(self.states[mask], self.reasons[mask])
+
 
 # Overlap needed to call two boxes in consecutive cycles the same object.
 MATCH_IOU = 0.3
@@ -53,6 +82,17 @@ STATIONARY_MEMORY = 12.0
 # ...but not less than this, so a short stationary_time cannot make the memory that
 # suppresses parked cars uselessly brief.
 STATIONARY_MEMORY_FLOOR = 60.0
+
+
+def stationary_window(stationary_time) -> float:
+	"""How long a STATIONARY entry outlives its last sighting.
+
+	Also how long a gap in updating can be before the tracker has to admit it no longer
+	knows what is out there: the two are the same number because it is the STATIONARY
+	entries that do the suppressing, and once they are gone there is nothing left to
+	suppress with.
+	"""
+	return max(stationary_time * STATIONARY_MEMORY, STATIONARY_MEMORY_FLOOR)
 
 
 class _Entry:
@@ -100,22 +140,35 @@ class MovementTracker:
 	def __init__(self, started=None, max_entries=200):
 		self.entries: list[_Entry] = []
 		self.started = started
+		# When update() was last called, as opposed to when anything was last seen. A
+		# disarmed stream is never looked at, and that is invisible to last_seen.
+		self.last_update = None
 		self.max_entries = max_entries
 
-	def update(self, boxes, class_ids, now, stationary_time, movement_threshold) -> np.ndarray:
+	def update(self, boxes, class_ids, now, stationary_time, movement_threshold) -> Movement:
 		"""Classify this cycle's boxes, and fold them into the memory.
 
-		Returns one state per box, in the order they were given, so the caller can carry
-		it alongside the detections through whatever filtering it does next.
+		Returns one state and one reason per box, in the order they were given, so the
+		caller can carry both alongside the detections through whatever filtering it does
+		next.
 		"""
 		if self.started is None:
 			self.started = now
+		elif (self.last_update is not None
+			  and now - self.last_update > stationary_window(stationary_time)):
+			# Nobody has been looking for long enough that _expire is about to throw away
+			# every entry that could vouch for a parked car. Resuming from that is a start
+			# in every sense that matters here, so warm up again rather than alarm on
+			# whatever has been sitting in the driveway all night.
+			self.started = now
+		self.last_update = now
 		boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
 		class_ids = (np.zeros(len(boxes), dtype=int) if class_ids is None
 					 else np.asarray(class_ids).reshape(-1).astype(int))
 		self._expire(now, stationary_time)
 
 		states = np.full(len(boxes), UNKNOWN, dtype=np.int8)
+		reasons = np.empty(len(boxes), dtype=object)
 		matched = self._match(boxes, class_ids)
 		# Nothing is known about an object during the first stationary_time of a stream:
 		# there has not been time to watch anything hold still, so calling a novel box
@@ -127,19 +180,19 @@ class MovementTracker:
 				entry = _Entry(class_ids[index], box, now,
 							   UNKNOWN if warming_up else MOVING)
 				self.entries.append(entry)
+				reasons[index] = 'warm-up' if warming_up else 'novel'
 			else:
-				self._advance(entry, box, class_ids[index], now,
-							  stationary_time, movement_threshold)
+				reasons[index] = self._advance(entry, box, class_ids[index], now,
+											   stationary_time, movement_threshold)
 			states[index] = entry.state
 		self._enforce_cap()
-		return states
+		return Movement(states, reasons)
 
 	# -- internals -----------------------------------------------------------
 
 	def _expire(self, now, stationary_time) -> None:
 		active_cutoff = now - stationary_time * ACTIVE_MEMORY
-		stationary_cutoff = now - max(stationary_time * STATIONARY_MEMORY,
-									  STATIONARY_MEMORY_FLOOR)
+		stationary_cutoff = now - stationary_window(stationary_time)
 		self.entries = [
 			entry for entry in self.entries
 			if entry.last_seen >= (stationary_cutoff if entry.state == STATIONARY
@@ -175,7 +228,13 @@ class MovementTracker:
 		return matched
 
 	@staticmethod
-	def _advance(entry, box, class_id, now, stationary_time, movement_threshold) -> None:
+	def _advance(entry, box, class_id, now, stationary_time, movement_threshold) -> str:
+		"""Re-judge a box against its own history, and say what the judgement rested on.
+
+		The reason carries the measured shift even when nothing changed, because the
+		number is what movement_threshold is tuned against and 'held 0.14' is the
+		difference between a threshold that is about right and one that is about to fire.
+		"""
 		anchor = entry.anchor
 		width = max(anchor[2] - anchor[0], 1.0)
 		height = max(anchor[3] - anchor[1], 1.0)
@@ -188,11 +247,14 @@ class MovementTracker:
 			entry.state = MOVING
 			entry.anchor = box
 			entry.anchor_time = now
-		elif now - entry.anchor_time >= stationary_time:
+			return f'moved {shift:.2f}'
+		if now - entry.anchor_time >= stationary_time:
 			entry.state = STATIONARY
+			return f'settled {shift:.2f}'
 		# Otherwise it holds whatever it was: a moving object keeps counting until it
 		# has been still long enough to have earned STATIONARY, which is what stops an
 		# arriving car from being dropped the moment it pauses at a gate.
+		return f'held {shift:.2f}'
 
 	def _enforce_cap(self) -> None:
 		if len(self.entries) <= self.max_entries:

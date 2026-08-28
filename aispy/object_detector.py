@@ -1,5 +1,6 @@
 import os
 import time
+from collections import deque
 from datetime import datetime
 import numpy as np
 import supervision as sv
@@ -10,7 +11,13 @@ from utils import mainlogger
 from detector import create_detector
 from detector.detector_api import DetectorAPI
 from detector.detectors.rknn import RknnDetectorConfig
-from movement_tracker import MovementTracker, MOVING, STATE_NAMES
+from movement_tracker import MovementTracker, Movement, MOVING, STATE_NAMES
+
+# Detector cycles of per-object detail kept per stream, dumped to the log when an event
+# fires. The alarm snapshot only ever shows the last cycle; the run-up to it is what says
+# whether an object was moving all along or merely looked new for one look.
+EVIDENCE_HISTORY = 20
+
 
 class ObjectDetector(mp.Process):
 
@@ -26,6 +33,7 @@ class ObjectDetector(mp.Process):
 		self.model: DetectorAPI | None = None
 		self.zones = {}
 		self.trackers = {}
+		self.evidence = {}
 		# Refreshed at the top of every pass, like the other live settings.
 		self.stationary_time = 5.0
 		self.movement_threshold = 0.15
@@ -83,7 +91,8 @@ class ObjectDetector(mp.Process):
 						frame = item[1]
 						motion_detections = item[2]
 						if self.streaminfos[0]['armed'].value and self.streaminfos[streamid]['armed'].value:
-							annotated_frame, num_detections = self.doinference(frame, streamid, motion_detections=motion_detections)
+							annotated_frame, num_detections, found = self.doinference(frame, streamid, motion_detections=motion_detections)
+							self.record_evidence(streamid, found)
 						else:
 							annotated_frame, num_detections = frame, 0
 						recordcounter = self.streaminfos[streamid]['recordcounter']
@@ -107,6 +116,8 @@ class ObjectDetector(mp.Process):
 						if recordcounter >= detections_for_event and self.streaminfos[streamid]['recordflag'].value != 1:
 							self.streaminfos[streamid]['recordflag'].value = 1
 							mainlogger.info(f'Item found on Stream {streamid} setting recordflag')
+							mainlogger.info(f'What raised Stream {streamid}:\n'
+											f'{self.evidence_report(streamid)}')
 							self.streaminfos[0]['alarm'].value = 1
 							self.snapshotqueue.put((streamid, annotated_frame,
 													f'Alarm Active on {self.settings.stream_name(streamid)}'))
@@ -186,6 +197,12 @@ class ObjectDetector(mp.Process):
 						dtype=bool)
 
 	def doinference(self, frame, streamid, double_check=True, motion_detections=None) -> tuple:
+		"""(annotated frame, how many counted, one description per object in the zone).
+
+		The descriptions are what the event log is built from, so they cover the ignored
+		objects too: 'the car was there and was called still' and 'the car was never found
+		at all' look identical in a count and need different fixes.
+		"""
 		starttime = datetime.now().timestamp()
 		confidence = self.streaminfos[streamid]['confidence_threshold']
 		classes, motion_classes = self.classes_for(streamid)
@@ -193,7 +210,7 @@ class ObjectDetector(mp.Process):
 			# Neither group holds anything, so there is nothing to look for. The model
 			# reads an empty class list as 'all of them', so this has to be caught here
 			# rather than handed down as a filter that filters nothing.
-			return frame, 0
+			return frame, 0, []
 		if motion_detections is None:
 			detections = self.model.detect(frame, classes=classes, conf=confidence,
 										nms=True, iou=0.5, verbose=False)
@@ -202,13 +219,13 @@ class ObjectDetector(mp.Process):
 		# Movement is judged on the whole frame, before the detect area is applied: a car
 		# approaching from outside the zone has already been seen moving by the time it
 		# crosses in, instead of arriving as an unknown and wasting a cycle.
-		states = self.tracker_for(streamid).update(
+		movement = self.tracker_for(streamid).update(
 			detections.xyxy, detections.class_id, time.monotonic(),
 			self.stationary_time, self.movement_threshold)
 		zone = self.zone_for(streamid, frame)
 		zone_mask = zone.trigger(detections=detections)
 		zone_detections = detections[zone_mask]
-		states = states[zone_mask]
+		movement = movement.select(zone_mask)
 		# Zoom in and recheck if an object is found
 		if len(zone_detections) and double_check:
 			verified = []
@@ -231,8 +248,8 @@ class ObjectDetector(mp.Process):
 					verified.append(False)
 			verified = np.array(verified, dtype=bool)
 			zone_detections = zone_detections[verified]
-			states = states[verified]
-		counting = self.counting_mask(zone_detections, states, motion_classes)
+			movement = movement.select(verified)
+		counting = self.counting_mask(zone_detections, movement.states, motion_classes)
 		annotated_frame = draw_polygon(frame, zone.polygon, color=sv.Color.GREEN)
 		# The suppressed boxes go on first, so a car that did not count cannot draw over
 		# the person standing next to it who did.
@@ -240,15 +257,60 @@ class ObjectDetector(mp.Process):
 		if len(suppressed):
 			annotated_frame = self.suppressedannotator.annotate(
 				annotated_frame, detections=suppressed,
-				labels=self.labels_for(suppressed, states[~counting], motion_classes))
+				labels=self.labels_for(suppressed, movement.states[~counting], motion_classes))
 		counted = zone_detections[counting]
 		annotated_frame = self.boxannotator.annotate(
 			annotated_frame, detections=counted,
-			labels=self.labels_for(counted, states[counting], motion_classes))
+			labels=self.labels_for(counted, movement.states[counting], motion_classes))
 		num_detections = len(counted)
 		inferencetime = datetime.now().timestamp() - starttime
 		self.avginferencetime = (self.avginferencetime * 19 + inferencetime) / 20
-		return (annotated_frame, num_detections)
+		return (annotated_frame, num_detections,
+				self.describe(zone_detections, movement, motion_classes, counting))
+
+	def describe(self, detections, movement: Movement, motion_classes, counting) -> list:
+		"""One line per object found in the zone: what it was, and what was made of it.
+
+		Box size and position are in here because the shift in a reason is a fraction of
+		the box's own width, not a number of pixels: 0.20 on a 40px box is eight pixels of
+		wobble on something far away, and 0.20 on a 600px box is a car pulling in.
+		"""
+		lines = []
+		for index, class_id in enumerate(detections.class_id):
+			x1, y1, x2, y2 = detections.xyxy[index]
+			gate = 'motion-only' if class_id in motion_classes else 'on-sight'
+			lines.append(
+				f'{self.model.model_names[class_id]} {detections.confidence[index]:0.2f} '
+				f'{"COUNTED" if counting[index] else "ignored"} [{gate}] '
+				f'{STATE_NAMES[int(movement.states[index])]} ({movement.reasons[index]}) '
+				f'{int(x2 - x1)}x{int(y2 - y1)}px at {int(x1)},{int(y1)}')
+		return lines
+
+	def record_evidence(self, streamid, found) -> None:
+		"""Keep the last few cycles of detail, so an event can be explained afterwards.
+
+		A ring rather than a debug log line: turning DEBUG on to catch the next false alarm
+		means logging every cycle of every stream until it happens, and the run-up is only
+		ever interesting for the cycles that actually led somewhere.
+		"""
+		if streamid not in self.evidence:
+			self.evidence[streamid] = deque(maxlen=EVIDENCE_HISTORY)
+		self.evidence[streamid].append((datetime.now().strftime('%H:%M:%S'), found))
+
+	def evidence_report(self, streamid) -> str:
+		"""The kept cycles as text, and a fresh start for whatever happens next.
+
+		Cleared as it is read: the question is always what led to *this* event, and a
+		second event minutes later re-reading the first one's run-up would be answering a
+		question nobody asked.
+		"""
+		lines = []
+		for stamp, found in self.evidence.pop(streamid, ()):
+			if found:
+				lines.extend(f'  {stamp}  {line}' for line in found)
+			else:
+				lines.append(f'  {stamp}  nothing in the detect area')
+		return '\n'.join(lines) or '  no detection history'
 
 	def labels_for(self, detections, states, motion_classes) -> list:
 		"""'person 0.82', or 'car 0.79 (still)' for a motion-only class.

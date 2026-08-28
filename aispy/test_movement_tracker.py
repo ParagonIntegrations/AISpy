@@ -13,7 +13,8 @@ import unittest
 # discovery from the directory above imports it as a package, which does not.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from movement_tracker import MOVING, STATIONARY, UNKNOWN, MovementTracker, iou_matrix
+from movement_tracker import (MOVING, STATIONARY, UNKNOWN, MovementTracker, iou_matrix,
+							  stationary_window)
 
 CAR = 2
 TRUCK = 7
@@ -35,7 +36,7 @@ class TrackerTest(unittest.TestCase):
 	def look(self, at, boxes, classes=None):
 		"""One detector pass at time `at`, returning the state of each box."""
 		classes = [CAR] * len(boxes) if classes is None else classes
-		return list(self.tracker.update(boxes, classes, at, STATIONARY_TIME, THRESHOLD))
+		return list(self.tracker.update(boxes, classes, at, STATIONARY_TIME, THRESHOLD).states)
 
 	def hold(self, since, until, boxes, classes=None, step=1.0):
 		"""Nothing moves between two times, polled at the detector's real cadence.
@@ -129,11 +130,11 @@ class TrackerTest(unittest.TestCase):
 	def test_cold_start_is_silent(self):
 		"""A restart with a car already parked in view must not alarm on it."""
 		tracker = MovementTracker(started=100.0)
-		states = [tracker.update([box(100, 200)], [CAR], at, STATIONARY_TIME, THRESHOLD)[0]
+		states = [tracker.update([box(100, 200)], [CAR], at, STATIONARY_TIME, THRESHOLD).states[0]
 				  for at in (100.5, 101.5, 102.5, 103.5, 104.5)]
 		self.assertEqual(list(states), [UNKNOWN] * 5)
 		self.assertEqual(list(tracker.update([box(100, 200)], [CAR], 105.5,
-											 STATIONARY_TIME, THRESHOLD)), [STATIONARY])
+											 STATIONARY_TIME, THRESHOLD).states), [STATIONARY])
 
 	def test_object_arriving_after_the_warm_up_still_counts(self):
 		"""The cold-start hush is a window after startup, not a property of new objects."""
@@ -141,7 +142,7 @@ class TrackerTest(unittest.TestCase):
 		for at in (100.5, 101.5, 102.5, 103.5, 104.5, 105.5, 106.5):
 			tracker.update([box(100, 200)], [CAR], at, STATIONARY_TIME, THRESHOLD)
 		self.assertEqual(list(tracker.update([box(100, 200), box(800, 400)], [CAR, CAR],
-											 107.5, STATIONARY_TIME, THRESHOLD)),
+											 107.5, STATIONARY_TIME, THRESHOLD).states),
 						 [STATIONARY, MOVING])
 
 	def test_two_cars_nose_to_tail_do_not_share_one_history(self):
@@ -158,6 +159,81 @@ class TrackerTest(unittest.TestCase):
 		self.assertEqual(self.hold(12.0, 15.0, [box(100, 200)]), [MOVING])
 		self.assertEqual(self.look(16.0, [box(100, 200)]), [STATIONARY])
 
+	# -- gaps in the looking, as opposed to gaps in the seeing -----------------
+
+	def test_parked_car_is_silent_when_a_stream_comes_back_from_disarm(self):
+		"""The overnight case: nothing is looked at while disarmed, so the memory expires.
+
+		Without a re-warm every parked car is novel come morning, and novel means moving.
+		The gap here is the real one - hours, not the seconds a flicker costs.
+		"""
+		self.look(10.0, [box(100, 200)])
+		self.assertEqual(self.hold(11.0, 16.0, [box(100, 200)]), [STATIONARY])
+		# ...disarmed all night, so update() is never called...
+		morning = 16.0 + 8 * 3600
+		self.assertEqual(self.hold(morning, morning + 4.0, [box(100, 200)]), [UNKNOWN])
+		self.assertEqual(self.look(morning + 5.0, [box(100, 200)]), [STATIONARY])
+
+	def test_a_gap_shorter_than_the_memory_does_not_re_warm(self):
+		"""A brief stall must not cost a detection: the memory still covers that long.
+
+		This is what makes disarming and immediately re-arming quiet in the first place,
+		and it is why toggling the panel is no test of the case above.
+		"""
+		self.look(10.0, [box(100, 200)])
+		self.assertEqual(self.hold(11.0, 16.0, [box(100, 200)]), [STATIONARY])
+		resume = 16.0 + stationary_window(STATIONARY_TIME) - 1.0
+		self.assertEqual(self.look(resume, [box(100, 200)]), [STATIONARY])
+		# Still awake to a genuine arrival, rather than hushed by a re-warm.
+		self.assertEqual(self.look(resume + 1.0, [box(100, 200), box(800, 400)]),
+						 [STATIONARY, MOVING])
+
+	def test_a_car_arriving_during_the_re_warm_is_the_known_cost(self):
+		"""Documenting the trade, not endorsing it: the re-warm is a hush, and it hushes.
+
+		Same cost as a cold start, for the same reason - there is nothing to judge a novel
+		box against - and the alternative is alarming on the parked car every morning.
+		"""
+		self.look(10.0, [box(100, 200)])
+		self.hold(11.0, 16.0, [box(100, 200)])
+		morning = 16.0 + 8 * 3600
+		self.assertEqual(self.look(morning, [box(0, 500)]), [UNKNOWN])
+
+	# -- saying why, not just what --------------------------------------------
+
+	def reasons(self, at, boxes, classes=None):
+		classes = [CAR] * len(boxes) if classes is None else classes
+		return list(self.tracker.update(boxes, classes, at, STATIONARY_TIME, THRESHOLD).reasons)
+
+	def test_every_route_to_a_state_names_itself(self):
+		"""The three ways to reach MOVING have three different fixes, so they must differ."""
+		self.assertEqual(self.reasons(10.0, [box(100, 200)]), ['novel'])
+		# Sub-threshold, and not yet still for long enough to have settled. 20px on a
+		# 200px box is 0.10 of its width, under the 0.15 threshold.
+		self.assertEqual(self.reasons(11.0, [box(120, 200)]), ['held 0.10'])
+		self.assertEqual(self.hold(12.0, 16.0, [box(100, 200)]), [STATIONARY])
+		self.assertEqual(self.reasons(17.0, [box(100, 200)]), ['settled 0.00'])
+		# 40px on a 200px box is 0.20 of its width, over the 0.15 threshold.
+		self.assertEqual(self.reasons(18.0, [box(140, 200)]), ['moved 0.20'])
+
+	def test_the_warm_up_hush_is_distinguishable_from_a_real_novel_box(self):
+		"""Both come back UNKNOWN-or-MOVING with no history; only the reason separates them."""
+		tracker = MovementTracker(started=100.0)
+		warm = tracker.update([box(100, 200)], [CAR], 100.5, STATIONARY_TIME, THRESHOLD)
+		self.assertEqual(list(warm.reasons), ['warm-up'])
+		later = tracker.update([box(100, 200), box(800, 400)], [CAR, CAR], 107.5,
+							   STATIONARY_TIME, THRESHOLD)
+		self.assertEqual(list(later.reasons)[1], 'novel')
+
+	def test_reasons_survive_the_masking_the_caller_does(self):
+		"""object_detector filters twice, and a reason out of step with its state is a lie."""
+		movement = self.tracker.update([box(100, 200), box(800, 400)], [CAR, CAR], 10.0,
+									   STATIONARY_TIME, THRESHOLD)
+		import numpy as np
+		kept = movement.select(np.array([False, True]))
+		self.assertEqual(len(kept.states), 1)
+		self.assertEqual(list(kept.reasons), ['novel'])
+
 	# -- housekeeping ---------------------------------------------------------
 
 	def test_entries_are_capped_dropping_stationary_ones_first(self):
@@ -170,7 +246,7 @@ class TrackerTest(unittest.TestCase):
 		self.assertTrue(all(entry.state == STATIONARY for entry in tracker.entries))
 		arriving = [box(400 * index, 900) for index in range(4)]
 		states = list(tracker.update(parked + arriving, [CAR] * 8, 17.0,
-									 STATIONARY_TIME, THRESHOLD))
+									 STATIONARY_TIME, THRESHOLD).states)
 		self.assertEqual(states, [STATIONARY] * 4 + [MOVING] * 4)
 		self.assertEqual(len(tracker.entries), 4)
 		# The arrivals are the ones worth remembering: they are still being decided.
