@@ -188,26 +188,57 @@ class MovementTracker:
 		self._enforce_cap()
 		return Movement(states, reasons)
 
+	def peek(self, boxes, class_ids, now, stationary_time) -> Movement:
+		"""What the memory already says about these boxes, writing nothing back.
+
+		A snapshot taken from the bot is a look nobody asked for: it happens whenever a
+		button is pressed, on a stream that may not even be armed. Folding it in through
+		update() would let it stand in for the regular cycles - it moves anchors, it
+		creates entries, and above all it counts as having looked, so a disarmed camera
+		polled by snapshots would never take the warm-up that stops every parked car
+		reading as novel when it is armed again. So this reads and does not write.
+
+		Nothing is matched against an entry that the next update() would throw away
+		anyway, which is what makes an untracked stream honestly answer 'unknown' rather
+		than reporting where a car was standing hours ago.
+		"""
+		boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+		class_ids = (np.zeros(len(boxes), dtype=int) if class_ids is None
+					 else np.asarray(class_ids).reshape(-1).astype(int))
+		states = np.full(len(boxes), UNKNOWN, dtype=np.int8)
+		reasons = np.empty(len(boxes), dtype=object)
+		matched = self._match(boxes, class_ids, self._live_entries(now, stationary_time))
+		for index in range(len(boxes)):
+			entry = matched.get(index)
+			states[index] = UNKNOWN if entry is None else entry.state
+			reasons[index] = ('not being tracked' if entry is None
+							  else f'remembered {STATE_NAMES[entry.state]}')
+		return Movement(states, reasons)
+
 	# -- internals -----------------------------------------------------------
 
-	def _expire(self, now, stationary_time) -> None:
+	def _live_entries(self, now, stationary_time) -> list:
 		active_cutoff = now - stationary_time * ACTIVE_MEMORY
 		stationary_cutoff = now - stationary_window(stationary_time)
-		self.entries = [
+		return [
 			entry for entry in self.entries
 			if entry.last_seen >= (stationary_cutoff if entry.state == STATIONARY
 								   else active_cutoff)]
 
-	def _match(self, boxes, class_ids) -> dict:
+	def _expire(self, now, stationary_time) -> None:
+		self.entries = self._live_entries(now, stationary_time)
+
+	def _match(self, boxes, class_ids, entries=None) -> dict:
 		"""Greedy best-overlap pairing of this cycle's boxes to remembered entries.
 
 		Same class at MATCH_IOU first, then a second pass at CROSS_CLASS_IOU that will
 		cross a class boundary, so a relabelled vehicle keeps its history.
 		"""
-		if not len(boxes) or not self.entries:
+		entries = self.entries if entries is None else entries
+		if not len(boxes) or not entries:
 			return {}
-		overlaps = iou_matrix(boxes, [entry.box for entry in self.entries])
-		entry_classes = np.array([entry.class_id for entry in self.entries])
+		overlaps = iou_matrix(boxes, [entry.box for entry in entries])
+		entry_classes = np.array([entry.class_id for entry in entries])
 		same_class = class_ids[:, None] == entry_classes[None, :]
 		matched = {}
 		taken = set()
@@ -223,7 +254,7 @@ class MovementTracker:
 					break
 				if box_index in matched or entry_index in taken:
 					continue
-				matched[int(box_index)] = self.entries[int(entry_index)]
+				matched[int(box_index)] = entries[int(entry_index)]
 				taken.add(int(entry_index))
 		return matched
 

@@ -2,6 +2,7 @@ import asyncio
 import copy
 import datetime
 import io
+import itertools
 import json
 import math
 import os
@@ -28,6 +29,11 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKe
 from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, MessageHandler, ConversationHandler,
                           ContextTypes, filters)
+
+# How long a snapshot waits for the detector to hand back an annotated frame. Longer than
+# a detection cycle plus an inference by a wide margin, because the only thing riding on
+# it is whether the picture has boxes drawn on it or not.
+SNAPSHOT_TIMEOUT = 15
 
 # The class groups a stream has, keyed by the short token that goes into a callback -
 # Telegram gives callback_data 64 bytes, which is not the place for column names.
@@ -83,11 +89,22 @@ restricted_to_alarmuser = restricted(lambda settings, user_id: settings.is_alarm
 
 class Telegrambot(mp.Process):
 
-    def __init__(self, streaminfos, dbupdatequeue):
+    def __init__(self, streaminfos, dbupdatequeue, snapshotrequests=None,
+                 snapshotreplies=None):
         mainlogger.info(f'Starting Telegrambot')
         super().__init__()
         self.streaminfos: dict = streaminfos
         self.dbupdatequeue = dbupdatequeue
+        # Snapshots are drawn by the detector, which is the process that holds the model.
+        # Without these queues - running the bot on its own, or against an app too old to
+        # provide them - snapshots still work, they just come back without any boxes.
+        self.snapshotrequests = snapshotrequests
+        self.snapshotreplies = snapshotreplies
+        # Requests still waiting for their frame, by request id. Touched by the collector
+        # thread and by whichever handler asked, hence the lock.
+        self.snapshotwaiters: dict = {}
+        self.snapshotlock = threading.Lock()
+        self.snapshotcounter = itertools.count()
         self.settings = get_store()
         self.application: Application | None = None
         # The Application's event loop, published by post_init while it is connected.
@@ -1104,13 +1121,74 @@ class Telegrambot(mp.Process):
                 streamids = [x for x in self.streaminfos.keys()][1:]
             else:
                 streamids = [streamid]
-            for stream in streamids:
-                img = self.streaminfos[stream]['framebuffer'][-1]
+            # Every camera is asked at once and read back in order: the detector answers
+            # them one after another in a single idle window, so asking for the next only
+            # after the previous picture has been sent would cost a cycle per camera.
+            requested = [(stream, self.request_snapshot(stream)) for stream in streamids]
+            for stream, waiter in requested:
+                img = await self.snapshot_frame(stream, waiter)
                 # encode
                 is_success, buffer = cv2.imencode(".jpg", img)
                 io_buf = io.BytesIO(buffer)
                 await update.effective_message.reply_photo(io_buf, self.stream_label(stream))
             await self.start_command(update, context)
+
+    def request_snapshot(self, streamid) -> dict | None:
+        """Ask the detector to draw this stream's current frame, without waiting for it.
+
+        Split from the waiting so a snapshot of every camera can ask for all of them
+        before reading any of the answers back.
+        """
+        if self.snapshotrequests is None:
+            return None
+        # Tagged with the pid as well as a counter: this process is restarted by the app
+        # if it ever dies, and a reply meant for the run before it must not be handed to
+        # whoever holds that number now.
+        requestid = f'{os.getpid()}-{next(self.snapshotcounter)}'
+        waiter = {'id': requestid, 'event': threading.Event(), 'frame': None}
+        with self.snapshotlock:
+            self.snapshotwaiters[requestid] = waiter
+        self.snapshotrequests.put((requestid, streamid))
+        return waiter
+
+    async def snapshot_frame(self, streamid, waiter, timeout=SNAPSHOT_TIMEOUT):
+        """The annotated frame if the detector produced one, the plain frame otherwise.
+
+        Nothing here is allowed to end in no picture at all: somebody pressed a button to
+        see the driveway, and a detector that is restarting, wedged, or not running costs
+        them the boxes rather than the photo.
+        """
+        if waiter is not None:
+            if await asyncio.to_thread(waiter['event'].wait, timeout):
+                if waiter['frame'] is not None:
+                    return waiter['frame']
+            else:
+                with self.snapshotlock:
+                    self.snapshotwaiters.pop(waiter['id'], None)
+                mainlogger.warning(
+                    f'No annotated snapshot for stream {streamid} within {timeout}s')
+        return self.streaminfos[streamid]['framebuffer'][-1]
+
+    def collect_snapshots(self) -> None:
+        """Hand each reply to whoever is waiting for it.
+
+        A thread of its own because the read blocks, and the loop it would otherwise block
+        is the one answering everybody else's buttons. Replies nobody is waiting for any
+        more - a request that timed out, or one from a previous run of this process - are
+        dropped on the floor, which is all they are good for.
+        """
+        while True:
+            try:
+                requestid, frame = self.snapshotreplies.get()
+                with self.snapshotlock:
+                    waiter = self.snapshotwaiters.pop(requestid, None)
+                if waiter is None:
+                    continue
+                waiter['frame'] = frame
+                waiter['event'].set()
+            except Exception:
+                mainlogger.exception('Problem reading snapshot replies, retrying in 1s')
+                time.sleep(1)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Displays info on how to use the bot."""
@@ -1451,6 +1529,11 @@ class Telegrambot(mp.Process):
         # Arming and the alarm relay run on their own loop: they must keep working even
         # while the Application below is stuck retrying a connection it cannot make.
         threading.Thread(target=self.run_local_logic, daemon=True).start()
+        # Snapshot replies are collected for as long as the process lives, not for as long
+        # as one Application does: a snapshot in flight while Telegram drops the connection
+        # is still worth handing over when the retry gets through.
+        if self.snapshotreplies is not None:
+            threading.Thread(target=self.collect_snapshots, daemon=True).start()
         backoff = 5
         while True:
             try:

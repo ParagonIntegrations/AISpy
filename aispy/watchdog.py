@@ -8,10 +8,15 @@ from utils import mainlogger
 
 class Watchdog(threading.Thread):
 
-	def __init__(self, streaminfo: dict):
+	def __init__(self, streaminfo: dict, snapshotrequests: mp.Queue = None,
+				 snapshotreplies: mp.Queue = None):
 		super().__init__()
 		self.streaminfos = streaminfo
 		self.snapshotqueue = mp.Queue()
+		# Made by the app rather than here: the bot is on the other end of them and was
+		# forked before this thread existed, so a queue created here could never reach it.
+		self.snapshotrequests = snapshotrequests
+		self.snapshotreplies = snapshotreplies
 		self.updatetime = mp.Value('d', 0.0)
 		self.detectorload = mp.Value('d', 0.0)
 		self.processes = []
@@ -24,7 +29,9 @@ class Watchdog(threading.Thread):
 			self.streaminfos,
 			self.snapshotqueue,
 			self.updatetime,
-			self.detectorload
+			self.detectorload,
+			self.snapshotrequests,
+			self.snapshotreplies
 		)
 		self.processes.append(detect)
 

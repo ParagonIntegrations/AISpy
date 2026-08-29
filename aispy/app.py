@@ -36,6 +36,11 @@ class FractalApp:
 
 	def init_shared_state_objects(self):
 		self.dbupdatequeue = mp.Queue()
+		# The bot asks the detector for an annotated frame over these and waits for the
+		# answer on the other. Both are made here because both ends are children of this
+		# process, and a multiprocessing queue only reaches a child that inherited it.
+		self.snapshotrequests = mp.Queue()
+		self.snapshotreplies = mp.Queue()
 		self.motionmanager = mp.Manager()
 		# TODO use these in the process
 		self.process_outputs['detector'] = {}
@@ -86,7 +91,8 @@ class FractalApp:
 			f'Stream {streamid} detecting on {detect_dimensions} and recording {dimensions}')
 
 	def start_telegrambot(self):
-		self.telegrambot = Telegrambot(self.streaminfos, self.dbupdatequeue)
+		self.telegrambot = Telegrambot(self.streaminfos, self.dbupdatequeue,
+									   self.snapshotrequests, self.snapshotreplies)
 		self.telegrambot.start()
 
 	def supervise_telegrambot(self, interval=10):
@@ -149,7 +155,7 @@ class FractalApp:
 		threading.Thread(target=self.supervise_telegrambot, daemon=True).start()
 
 		# Create and start the detector watchdog
-		watchdog = Watchdog(self.streaminfos)
+		watchdog = Watchdog(self.streaminfos, self.snapshotrequests, self.snapshotreplies)
 		watchdog.start()
 
 		# Start the dbupdater

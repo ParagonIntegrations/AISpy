@@ -267,6 +267,68 @@ class TrackerTest(unittest.TestCase):
 		self.assertEqual(self.look(11.0, [[50, 50, 50, 50]]), [MOVING])
 
 
+class PeekTest(unittest.TestCase):
+	"""Reading the memory for a snapshot, which must not count as having looked.
+
+	Snapshots are taken by pressing a button, on any stream, armed or not. That makes them
+	the one caller that can reach the tracker at a time nothing else does, so the thing to
+	pin down is that they leave it exactly as they found it.
+	"""
+
+	def setUp(self):
+		self.tracker = MovementTracker(started=0.0)
+
+	def look(self, at, boxes, classes=None):
+		classes = [CAR] * len(boxes) if classes is None else classes
+		return list(self.tracker.update(boxes, classes, at, STATIONARY_TIME, THRESHOLD).states)
+
+	def peek(self, at, boxes, classes=None):
+		classes = [CAR] * len(boxes) if classes is None else classes
+		return list(self.tracker.peek(boxes, classes, at, STATIONARY_TIME).states)
+
+	def settle(self, at, boxes):
+		"""Watch `boxes` hold still long enough to be called stationary."""
+		while at <= 10.0 + STATIONARY_TIME * 2:
+			self.look(at, boxes)
+			at += 1.0
+
+	def test_reports_what_the_memory_already_knows(self):
+		self.settle(10.0, [box(100, 200)])
+		self.assertEqual(self.peek(20.0, [box(100, 200)]), [STATIONARY])
+
+	def test_object_nothing_knows_about_is_unknown(self):
+		"""Not MOVING: novelty means motion when the tracker is watching every cycle, and
+		a snapshot of a stream nobody is inferencing is the case where it does not."""
+		self.settle(10.0, [box(100, 200)])
+		self.assertEqual(self.peek(20.0, [box(700, 200)]), [UNKNOWN])
+
+	def test_forgets_at_the_same_time_update_would(self):
+		"""A car remembered from hours ago is not evidence about the car in front of us."""
+		self.settle(10.0, [box(100, 200)])
+		stale = 20.0 + stationary_window(STATIONARY_TIME) + 1.0
+		self.assertEqual(self.peek(stale, [box(100, 200)]), [UNKNOWN])
+
+	def test_creates_nothing_to_be_found_later(self):
+		"""Peeking at an object must not leave an entry behind for the next cycle to match
+		against, or a snapshot would be enough to make an arriving car look established."""
+		self.assertEqual(self.peek(10.0, [box(100, 200)]), [UNKNOWN])
+		self.assertEqual(self.look(10.0, [box(100, 200)]), [MOVING])
+
+	def test_does_not_count_as_having_looked(self):
+		"""The case this exists for: a disarmed camera being snapshotted through the night.
+
+		Nothing is inferencing it, so by morning the memory is stale and every parked car
+		is novel - which is why a gap that long restarts the warm-up. Snapshots in the gap
+		must not fill it in, or the first armed cycle alarms on the whole driveway.
+		"""
+		self.settle(10.0, [box(100, 200)])
+		morning = 20.0
+		while morning < 20.0 + stationary_window(STATIONARY_TIME) * 2:
+			self.peek(morning, [box(100, 200)])
+			morning += 60.0
+		self.assertEqual(self.look(morning, [box(100, 200)]), [UNKNOWN])
+
+
 class IouTest(unittest.TestCase):
 
 	def test_identical_boxes(self):

@@ -1,4 +1,5 @@
 import os
+import queue
 import time
 from collections import deque
 from datetime import datetime
@@ -22,10 +23,17 @@ EVIDENCE_HISTORY = 20
 class ObjectDetector(mp.Process):
 
 	def __init__(self, streaminfo: dict, snapshotqueue: mp.Queue,
-				 updatetime: mp.Value, detectorload: mp.Value):
+				 updatetime: mp.Value, detectorload: mp.Value,
+				 snapshotrequests: mp.Queue = None, snapshotreplies: mp.Queue = None):
 		super().__init__()
 		self.streaminfos = streaminfo
 		self.snapshotqueue = snapshotqueue
+		# Snapshots asked for from the bot are answered here rather than there, because
+		# this process is the one holding the model: the NPU has a single loaded copy of
+		# it, and a second one in the bot would be a second copy of the weights to keep a
+		# button press company.
+		self.snapshotrequests = snapshotrequests
+		self.snapshotreplies = snapshotreplies
 		self.settings = get_store()
 		self.avginferencetime = self.settings.get('avg_inference_time')
 		self.updatetime = updatetime
@@ -138,10 +146,10 @@ class ObjectDetector(mp.Process):
 					self.updatetime.value = now.timestamp()
 					self.detectorload.value = (self.detectorload.value*19 + (1-time_left/check_detection_time.total_seconds()))/20
 
-					# Sleep if no more work is available
-					if time_left > 0:
-						mainlogger.debug(f'Sleeping for {time_left} seconds')
-						time.sleep(time_left)
+					# Whatever is left of the cycle goes to the bot's snapshot requests, and
+					# then to sleeping off the remainder.
+					mainlogger.debug(f'Idle for {time_left} seconds')
+					self.serve_snapshots(time.monotonic() + time_left)
 			except:
 				mainlogger.exception(f'Problem in detector restarting in 10 seconds')
 				time.sleep(10)
@@ -351,6 +359,95 @@ class ObjectDetector(mp.Process):
 			else:
 				lines.append(f'  {stamp}  nothing recorded')
 		return '\n'.join(lines) or '  no detection history'
+
+	# -- snapshots on request -------------------------------------------------
+
+	def serve_snapshots(self, until) -> None:
+		"""Answer the bot's snapshot requests until the next cycle is due.
+
+		This is what the tail of a cycle is for: the detector wakes on a fixed interval and
+		is then idle for whatever is left of it, so a snapshot costs one inference in time
+		that was going to be spent sleeping. Requests that arrive with nothing left of the
+		cycle are answered anyway rather than held over - somebody is waiting on a chat
+		message for it, and a detector too busy to have idle time is exactly when there is
+		something out there worth looking at.
+		"""
+		if self.snapshotrequests is None:
+			if until > time.monotonic():
+				time.sleep(until - time.monotonic())
+			return
+		while True:
+			timeout = until - time.monotonic()
+			try:
+				if timeout > 0:
+					request = self.snapshotrequests.get(timeout=timeout)
+				else:
+					request = self.snapshotrequests.get_nowait()
+			except queue.Empty:
+				return
+			self.answer_snapshot(*request)
+
+	def answer_snapshot(self, requestid, streamid) -> None:
+		"""One request, answered with a frame or with nothing.
+
+		Always answered, one way or the other: the bot is holding a request open against a
+		timeout, and the plain unannotated frame it falls back to is much better sent now
+		than in ten seconds' time.
+		"""
+		try:
+			frame = self.streaminfos[streamid]['framebuffer'][-1]
+			self.snapshotreplies.put((requestid, self.annotate_snapshot(streamid, frame)))
+		except Exception:
+			mainlogger.exception(f'Could not annotate a snapshot of stream {streamid}')
+			self.snapshotreplies.put((requestid, None))
+
+	def annotate_snapshot(self, streamid, frame) -> np.ndarray:
+		"""A frame with a box on each of the objects this stream is watching for.
+
+		Only those: the model is asked for the stream's two class groups and nothing else,
+		so a snapshot carries the objects the alarm is about rather than every chair and
+		potted plant in view.
+
+		Coloured the way an alarm snapshot is coloured - blue for what would raise an
+		event, grey for what would not, whether that is because it is outside the detect
+		area or because it is a motion-only class that is not moving. The point of a
+		snapshot on a quiet camera is usually 'why has this not gone off', and that is an
+		answer to it rather than a second vocabulary to learn.
+
+		No zoomed-in recheck, unlike a detection cycle: that exists to keep a doubtful box
+		from raising an alarm, and here nothing is being raised. Showing the box and
+		letting whoever pressed the button judge it costs one inference instead of one per
+		object.
+		"""
+		confidence = self.streaminfos[streamid]['confidence_threshold']
+		classes, motion_classes = self.classes_for(streamid)
+		if not classes:
+			# Nothing is being watched for on this stream, so there is nothing to draw and
+			# no class list to hand the model - it reads an empty one as 'all of them'.
+			return frame
+		detections = self.model.detect(frame, classes=classes, conf=confidence,
+									   nms=True, iou=0.5, verbose=False)
+		# peek, not update: a snapshot is a look nobody scheduled, and letting it write to
+		# the movement memory would let button presses stand in for the detection cycles a
+		# disarmed stream is deliberately not getting.
+		movement = self.tracker_for(streamid).peek(
+			detections.xyxy, detections.class_id, time.monotonic(), self.stationary_time)
+		zone = self.zone_for(streamid, frame)
+		counting = (self.counting_mask(detections, movement.states, motion_classes)
+					& zone.trigger(detections=detections))
+		annotated_frame = draw_polygon(frame, zone.polygon, color=sv.Color.GREEN)
+		# Suppressed first, so a parked car cannot draw over the person walking past it.
+		suppressed = detections[~counting]
+		if len(suppressed):
+			annotated_frame = self.suppressedannotator.annotate(
+				annotated_frame, detections=suppressed,
+				labels=self.labels_for(suppressed, movement.states[~counting], motion_classes))
+		counted = detections[counting]
+		if len(counted):
+			annotated_frame = self.boxannotator.annotate(
+				annotated_frame, detections=counted,
+				labels=self.labels_for(counted, movement.states[counting], motion_classes))
+		return annotated_frame
 
 	def labels_for(self, detections, states, motion_classes) -> list:
 		"""'person 0.82', or 'car 0.79 (still)' for a motion-only class.
