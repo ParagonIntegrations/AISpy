@@ -197,11 +197,12 @@ class ObjectDetector(mp.Process):
 						dtype=bool)
 
 	def doinference(self, frame, streamid, double_check=True, motion_detections=None) -> tuple:
-		"""(annotated frame, how many counted, one description per object in the zone).
+		"""(annotated frame, how many counted, what this cycle saw).
 
 		The descriptions are what the event log is built from, so they cover the ignored
 		objects too: 'the car was there and was called still' and 'the car was never found
-		at all' look identical in a count and need different fixes.
+		at all' look identical in a count and need different fixes. A cycle that found
+		nothing says which stage emptied it rather than going quiet, for the same reason.
 		"""
 		starttime = datetime.now().timestamp()
 		confidence = self.streaminfos[streamid]['confidence_threshold']
@@ -210,7 +211,7 @@ class ObjectDetector(mp.Process):
 			# Neither group holds anything, so there is nothing to look for. The model
 			# reads an empty class list as 'all of them', so this has to be caught here
 			# rather than handed down as a filter that filters nothing.
-			return frame, 0, []
+			return frame, 0, ['no classes selected for this stream']
 		if motion_detections is None:
 			detections = self.model.detect(frame, classes=classes, conf=confidence,
 										nms=True, iou=0.5, verbose=False)
@@ -222,10 +223,16 @@ class ObjectDetector(mp.Process):
 		movement = self.tracker_for(streamid).update(
 			detections.xyxy, detections.class_id, time.monotonic(),
 			self.stationary_time, self.movement_threshold)
+		# Kept for the evidence line: once everything has been filtered away there is no
+		# way back to how many there were to begin with, and 'the model saw nothing' and
+		# 'the model saw it and the zoom-in threw it out' are the same empty list.
+		on_frame = len(detections)
+		overridden = self.model.overridden if motion_detections is None else {}
 		zone = self.zone_for(streamid, frame)
 		zone_mask = zone.trigger(detections=detections)
 		zone_detections = detections[zone_mask]
 		movement = movement.select(zone_mask)
+		in_zone = len(zone_detections)
 		# Zoom in and recheck if an object is found
 		if len(zone_detections) and double_check:
 			verified = []
@@ -265,8 +272,41 @@ class ObjectDetector(mp.Process):
 		num_detections = len(counted)
 		inferencetime = datetime.now().timestamp() - starttime
 		self.avginferencetime = (self.avginferencetime * 19 + inferencetime) / 20
-		return (annotated_frame, num_detections,
-				self.describe(zone_detections, movement, motion_classes, counting))
+		found = self.describe(zone_detections, movement, motion_classes, counting)
+		if not found:
+			found = [self.nothing_found(on_frame, in_zone)]
+		if overridden:
+			found.append(self.contested(overridden))
+		return annotated_frame, num_detections, found
+
+	@staticmethod
+	def nothing_found(on_frame, in_zone) -> str:
+		"""Which stage emptied the frame, for the cycles that produced nothing.
+
+		Every stage here ends in the same empty list, and they have nothing in common: a
+		model that never saw the truck, a detect area drawn short of where it parks, and a
+		zoom-in recheck that will not confirm it are three different faults with three
+		different fixes, and the run-up to an event is exactly where the difference
+		matters.
+		"""
+		if not on_frame:
+			return 'nothing found on the frame at all'
+		if not in_zone:
+			return f'nothing in the detect area ({on_frame} found, all outside it)'
+		return (f'nothing in the detect area ({in_zone} of {on_frame} inside it, '
+				f'all rejected by the zoom-in recheck)')
+
+	def contested(self, overridden) -> str:
+		"""Classes the model preferred to the one it was allowed to use.
+
+		The detector now scores only the classes this stream asked for, so these boxes are
+		kept rather than discarded - but a class that keeps winning is worth saying out
+		loud, because it means the model and the class list disagree about what is out
+		there, and the disagreement used to be silent.
+		"""
+		preferred = ', '.join(f'{self.model.model_names[class_id]} {score:0.2f}'
+							  for class_id, score in sorted(overridden.items()))
+		return f'model would rather have called something {preferred}'
 
 	def describe(self, detections, movement: Movement, motion_classes, counting) -> list:
 		"""One line per object found in the zone: what it was, and what was made of it.
@@ -309,7 +349,7 @@ class ObjectDetector(mp.Process):
 			if found:
 				lines.extend(f'  {stamp}  {line}' for line in found)
 			else:
-				lines.append(f'  {stamp}  nothing in the detect area')
+				lines.append(f'  {stamp}  nothing recorded')
 		return '\n'.join(lines) or '  no detection history'
 
 	def labels_for(self, detections, states, motion_classes) -> list:

@@ -12,6 +12,7 @@ from pydantic import Field
 from detector.detector_config import BaseDetectorConfig, BaseModelConfig
 from detector.detector_api import DetectorAPI
 from detector.utils.ops import xywh2xyxy, scale_boxes, LetterBox
+from class_scores import select_classes, overridden_by
 
 try:
     from hide_warnings import hide_warnings  # noqa
@@ -78,6 +79,9 @@ class Rknn(DetectorAPI):
         self.model_width = config.model.width
         self.model_path = config.model.path or "default-yolov8n"
         self.model_names = config.model.names
+        # Filled in by every detect(): the classes that outscored the one a returned box
+        # was given. See class_scores.overridden_by.
+        self.overridden = {}
 
         if self.model_path in yolov8_suffix:
             if self.model_path == "default-yolov8n":
@@ -161,13 +165,16 @@ class Rknn(DetectorAPI):
         class_list = classes if classes else list(range(num_classes))
 
         prediction = np.transpose(prediction[0, :, :])  # Change to shape (2100, 84)
-        conf_array = prediction[:, 4:].max(1)
-        class_array = prediction[:, 4:].argmax(1)
-        conf_filter = conf_array > conf_thres
-        class_filter = np.isin(class_array, class_list)
-        combined_filter = np.logical_and(conf_filter, class_filter)
+        scores = prediction[:, 4:]
+        # Not a filter applied to the winning class: see class_scores for why that loses
+        # whole objects silently.
+        conf_array, class_array, wanted = select_classes(scores, class_list)
+        combined_filter = conf_array > conf_thres
+        self.overridden = overridden_by(scores, wanted, combined_filter)
 
-        prediction = prediction[:, :6]
+        # Copied because the writes below would otherwise land in the buffer `scores` is a
+        # view of, and silently rewrite the class-0 and class-1 columns it is read from.
+        prediction = prediction[:, :6].copy()
         prediction[:, 4] = conf_array
         prediction[:, 5] = class_array
         prediction = prediction[combined_filter, :]
