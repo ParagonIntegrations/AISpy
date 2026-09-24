@@ -1,1 +1,4 @@
 /data
+aispy/settings.py
+aispy/settings.py.save
+aispy/__pycache__/
